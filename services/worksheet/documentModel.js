@@ -322,6 +322,20 @@ async function safe(label, fn, fallback) {
   }
 }
 
+// docx pictures (hosted urls in mammoth's text, document order) ↔ the
+// pictures embedded in its PDF render (reading order). Linked only when the
+// counts match, so every pairing is certain; returns Map(picture → url) and
+// gives each linked picture that url.
+function linkDocxPictures(structuredText, pictures) {
+  const links = new Map();
+  const urls = [...String(structuredText || '').matchAll(/\[IMAGE: url=(https?:\/\/[^\]\s]+)\]/g)].map(m => m[1]);
+  const embedded = pictures.filter(p => !p.vector && p.bbox)
+    .sort((a, b) => a.page - b.page || a.bbox.y - b.bbox.y || a.bbox.x - b.bbox.x);
+  if (!urls.length || urls.length !== embedded.length) return links;
+  embedded.forEach((img, i) => { img.url = urls[i]; links.set(img, urls[i]); });
+  return links;
+}
+
 /**
  * @param {object} input
  * @param {Buffer} input.buffer        PDF or image bytes
@@ -430,7 +444,13 @@ async function buildDocumentModel({ buffer, mime, structuredText = '', hints = [
       pagePictures.push(...drawn);
     }
     for (const img of pagePictures) pictures.push(img);
-    pages.push({ page: lp.page, width: lp.width, height: lp.height, source, assessment, ocrConfidence: ocrResult ? ocrResult.confidence : null, textItems, pagePictures, raster });
+    // Rows that locate a task on the page (regionCrops.js). For a docx the
+    // transcript drops OCR lines the docx text already has, which are exactly
+    // the task headings — so the anchors keep every OCR line outside a picture.
+    const anchorItems = structuredText
+      ? ocrLines.filter(l => !pagePictures.some(img => overlapRatio(l, img.bbox) >= 0.7))
+      : textItems;
+    pages.push({ page: lp.page, width: lp.width, height: lp.height, source, assessment, ocrConfidence: ocrResult ? ocrResult.confidence : null, textItems, anchorItems, pagePictures, raster });
     diagnostics.pages.push({
       page: lp.page, source, textLayerReliable: assessment.reliable, textLayerScripts: assessment.scripts,
       ocrConfidence: ocrResult ? ocrResult.confidence : null, lines: textItems.length,
@@ -457,17 +477,22 @@ async function buildDocumentModel({ buffer, mime, structuredText = '', hints = [
   // The transcript refers to pictures by short ids (img://p1-3): models copy
   // them reliably, and quizVision resolves them to the hosted url — or to an
   // inline image when hosting isn't configured — after generation.
+  pictures.forEach((img, idx) => { img.id = `img://p${img.page}-${idx + 1}`; img.url = null; });
+  // docx: its pictures are already hosted and sit at their exact place in the
+  // docx text. Each one is the same picture this PDF render embeds, so the
+  // text marker takes the picture's id (one id per picture, with its bytes
+  // for splitting) and the picture keeps the hosted url.
+  const docxLinks = linkDocxPictures(structuredText, pictures);
   let hosted = [];
-  if (pictures.length && hostImages) hosted = await safe('host pictures', () => hostImages(pictures), []);
-  pictures.forEach((img, idx) => {
-    img.id = `img://p${img.page}-${idx + 1}`;
-    img.url = hosted[idx] && hosted[idx].url ? hosted[idx].url : null;
-  });
+  const toHost = pictures.filter(img => !img.url);
+  if (toHost.length && hostImages) hosted = await safe('host pictures', () => hostImages(toHost), []);
+  toHost.forEach((img, idx) => { img.url = hosted[idx] && hosted[idx].url ? hosted[idx].url : null; });
 
+  const marker = img => `[IMAGE: url=${img.id}]` + (img.labels ? ` (text in picture: ${img.labels})` : '');
   const pageTexts = pages.map((p) => {
     const items = [
       ...p.textItems,
-      ...p.pagePictures.map(img => ({ kind: 'image', x: img.bbox.x, y: img.bbox.y, w: img.bbox.w, h: img.bbox.h, text: `[IMAGE: url=${img.id}]` + (img.labels ? ` (text in picture: ${img.labels})` : '') })),
+      ...p.pagePictures.filter(img => !docxLinks.has(img)).map(img => ({ kind: 'image', x: img.bbox.x, y: img.bbox.y, w: img.bbox.w, h: img.bbox.h, text: marker(img) })),
     ];
     const rows = composeRows(items);
     return `--- Page ${p.page} ---\n${rows.join('\n')}`;
@@ -475,8 +500,10 @@ async function buildDocumentModel({ buffer, mime, structuredText = '', hints = [
 
   let text;
   if (structuredText) {
+    let docxText = structuredText.trim();
+    for (const [img, url] of docxLinks) docxText = docxText.split(`[IMAGE: url=${url}]`).join(marker(img));
     const extra = pageTexts.map(t => t.replace(/^--- Page \d+ ---\n?/, '')).join('\n').trim();
-    text = structuredText.trim() + (extra ? `\n\n[TEXT READ FROM PICTURES/SCREENSHOTS IN THE DOCUMENT (OCR) — part of the worksheet content]\n${extra}` : '');
+    text = docxText + (extra ? `\n\n[TEXT READ FROM PICTURES/SCREENSHOTS IN THE DOCUMENT (OCR) — part of the worksheet content]\n${extra}` : '');
   } else {
     text = pageTexts.join('\n\n');
   }
@@ -489,7 +516,7 @@ async function buildDocumentModel({ buffer, mime, structuredText = '', hints = [
 
   // Positions of every text row, so a quiz task can be traced back to its
   // region of the page (see regionCrops.js).
-  const anchors = pages.flatMap(p => p.textItems.map(t => ({ page: p.page, y: t.y, h: t.h, text: t.text })));
+  const anchors = pages.flatMap(p => p.anchorItems.map(t => ({ page: p.page, y: t.y, h: t.h, text: t.text })));
   const pageSizes = pages.map(p => ({ page: p.page, width: p.width, height: p.height }));
 
   return {
@@ -506,4 +533,4 @@ async function buildDocumentModel({ buffer, mime, structuredText = '', hints = [
   };
 }
 
-module.exports = { buildDocumentModel, pairFractions, readingOrder, assessTextLayer, cleanLine, composeRows, classifyImage, isTextImage, isDecorative, coveredBy, makeCorpus, tokensOf };
+module.exports = { buildDocumentModel, linkDocxPictures, pairFractions, readingOrder, assessTextLayer, cleanLine, composeRows, classifyImage, isTextImage, isDecorative, coveredBy, makeCorpus, tokensOf };

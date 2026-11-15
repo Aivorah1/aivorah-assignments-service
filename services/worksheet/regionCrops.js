@@ -75,6 +75,40 @@ function attachRegionPictures(quiz, doc) {
   return attached;
 }
 
+// Same as attachRegionPictures, by reading order instead of page position:
+// the pictures marked in the transcript between a task's heading and the next
+// task's heading. Catches what positions can't (no OCR anchors on a docx page,
+// a heading OCR misread) — the docx transcript keeps every picture in place.
+function attachTranscriptPictures(quiz, doc) {
+  const lines = String((doc && doc.text) || '').split('\n');
+  const known = new Set(((doc && doc.pictures) || []).map(p => p.id));
+  const lineOf = (title) => {
+    const want = tokensOf(title);
+    if (!want.length) return -1;
+    let best = -1; let bestScore = 0.6;
+    lines.forEach((l, i) => {
+      const have = new Set(tokensOf(l));
+      const s = want.filter(t => have.has(t)).length / want.length;
+      if (s >= bestScore && !/\[IMAGE:/.test(l)) { best = i; bestScore = s + 1e-9; }
+    });
+    return best;
+  };
+  const tasks = (quiz.tasks || []).map(t => ({ task: t, at: lineOf(t.title) }));
+  let attached = 0;
+  for (const { task, at } of tasks) {
+    if (at < 0 || hasPicture(task) || !taskNeedsPicture(task) || !(task.questions || []).length) continue;
+    const end = tasks.filter(o => o.at > at).map(o => o.at).sort((a, b) => a - b)[0] ?? lines.length;
+    const ids = lines.slice(at + 1, end).flatMap(l => [...l.matchAll(/\[IMAGE: url=(img:\/\/[^\]\s]+)\]/g)].map(m => m[1]))
+      .filter(id => known.has(id));
+    if (!ids.length) continue;
+    const qs = task.questions;
+    if (ids.length > 1 && ids.length === qs.length) ids.forEach((id, i) => { qs[i].imageUrl = id; });
+    else { qs[0].imageUrl = ids[0]; task.sharedImage = true; }
+    attached++;
+  }
+  return attached;
+}
+
 // What a picture prints, as tokens: "1) 28/50 ; 8/24" → 28/50, 8/24. Item
 // numbers ("1)", a lone "5") are left out — they're the question labels.
 function pictureTokens(labels) {
@@ -199,6 +233,7 @@ const dataUri = p => `data:${p.mime || 'image/png'};base64,${p.buffer.toString('
 async function attachRegionCrops(quiz, doc, hostImages) {
   if (!doc || !doc.anchors) return 0;
   attachRegionPictures(quiz, doc);
+  attachTranscriptPictures(quiz, doc);
   const droppedIds = new Set();
   dropTextOnlyPictures(quiz, doc, droppedIds);
   attachOrphanPictures(quiz, doc, droppedIds);
@@ -243,4 +278,4 @@ function resolvePictureRefs(quiz, doc) {
   return quiz;
 }
 
-module.exports = { attachRegionCrops, attachRegionPictures, dropTextOnlyPictures, attachOrphanPictures, resolvePictureRefs, findAnchor, taskNeedsPicture };
+module.exports = { attachRegionCrops, attachRegionPictures, attachTranscriptPictures,dropTextOnlyPictures, attachOrphanPictures, resolvePictureRefs, findAnchor, taskNeedsPicture };

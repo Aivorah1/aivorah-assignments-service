@@ -1582,15 +1582,24 @@ async function generateQuizFromDocument({ buffer, mime, grade, subject, school, 
   enforceVisualGrounding(result, { visualUnderstandingAvailable, sourceText });
   flagUngroundedTaskContent(result, { visualUnderstandingAvailable, sourceText });
   flagUnverifiedNumbers(result, { visualUnderstandingAvailable, sourceText });
+  const { hostPictures } = require('./worksheet/providers');
   if (doc) {
-    // Tasks without pictures get their region's pictures, or the region itself;
-    // then picture ids become real (or inline) images.
-    const { attachRegionCrops, resolvePictureRefs } = require('./worksheet/regionCrops');
-    const { hostPictures } = require('./worksheet/providers');
+    // Tasks without pictures get their region's pictures, or the region itself.
+    const { attachRegionCrops } = require('./worksheet/regionCrops');
     result.regionCrops = await attachRegionCrops(result, doc, hostPictures).catch((err) => {
       console.warn('[quiz] region crops failed:', err.message);
       return 0;
     });
+  }
+  // One picture holding every question's own numbered figure → one crop per question.
+  const { splitSharedFigures } = require('./worksheet/figureSplit');
+  result.figuresSplit = await splitSharedFigures(result, doc, { hostImages: hostPictures }).catch((err) => {
+    console.warn('[quiz] figure split failed:', err.message);
+    return 0;
+  });
+  if (doc) {
+    // Picture ids become real (or inline) images.
+    const { resolvePictureRefs } = require('./worksheet/regionCrops');
     resolvePictureRefs(result, doc);
   }
   result.extractionStatus = computeExtractionStatus(result);
