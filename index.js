@@ -15,6 +15,8 @@ app.use('/assignments', require('./routes/assignments'));
 app.use('/curriculum', require('./routes/curriculum'));
 app.use('/jobs', require('./routes/jobs'));
 app.use('/quiz', require('./routes/quiz'));
+// Prepare Worksheet: the teacher's own documents and sharing within their school (its own sign-in check).
+app.use('/worksheets', require('./routes/worksheets'));
 
 // EXPERIMENTAL / TEST-ONLY — Gemini-independent fallback POC (see
 // services/poc/fallbackPipelinePoc.js). Never mounted unless explicitly

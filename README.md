@@ -10,6 +10,7 @@ grading, quiz generation, and fill-blank validation — extracted from
 ```
 routes/
   assignments.js   — the 6 student-facing endpoints (see below)
+  worksheets.js    — Prepare Worksheet documents and sharing (see below)
 services/
   supabase.js       — Supabase client
   embeddings.js      — local embedding model (Xenova/all-MiniLM-L6-v2)
@@ -79,6 +80,23 @@ Runs on `PORT` (default `3015`).
   `Authorization: Bearer <Firebase ID token>`; the teacher is taken from the
   token, never from the request. Requires `FIREBASE_SERVICE_ACCOUNT_B64`
   (same value as the other services).
+- `/worksheets` — **Prepare Worksheet** (Teacher Portal > Assignments > + New >
+  Prepare Worksheet, and Library > Shared to you; tables `teacher_worksheets`
+  and `teacher_worksheet_shares`, aivorah-db 0025). Same sign-in as the
+  library (Bearer Firebase token; the teacher comes from the token).
+  - `GET /worksheets`, `POST /worksheets` `{ title, html }` — my documents / save a new one.
+  - `GET /worksheets/:id`, `PUT /worksheets/:id` `{ title?, html? }` — open (mine,
+    or shared with me) / save again (owner only).
+  - `GET /worksheets/teachers` — the other teachers of my school (Share box).
+  - `POST /worksheets/:id/share` `{ teacherId }` — owner only, to a teacher of the
+    same school only (checked here).
+  - `GET /worksheets/shared` — documents shared with me by teachers of my school.
+  - `GET /worksheets/:id/docx` — `{ fileName, mimeType, base64 }`, the Word file
+    for Download and for Assign (the app feeds it to the Upload Worksheet flow:
+    `docx-to-pdf`, `upload-doc`, `extract-questions-async`).
+  Saved HTML is cleaned (`services/worksheetHtml.js`: no scripts, handlers or
+  frames); pasted images are moved to Cloudinary on save; images from other
+  websites are fetched (public addresses only) and embedded in the .docx.
 - `GET /health`
 
 ## Branching

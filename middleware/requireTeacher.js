@@ -26,7 +26,7 @@ async function requireTeacher(req, res, next) {
 
   const { data: user, error } = await supabase
     .from('users')
-    .select('id, role, email, name, school')
+    .select('id, role, email, name, school, school_id')
     .eq('email', decoded.email.toLowerCase())
     .maybeSingle();
   if (error) return res.status(500).json({ error: 'Could not load your account' });
