@@ -107,6 +107,25 @@ cloudinary.config({
 });
 const MCQ_LETTER_TO_INDEX = { A: 0, B: 1, C: 2, D: 3 };
 
+// ── Student reasoning ("Why did you choose this answer?") ───────────────────
+// Max characters for a student's reasoning text (per question).
+const MAX_REASONING_CHARS = 500;
+
+// Sanitise a single reasoning string: coerce to string, trim, cap length.
+// Returns the cleaned reasoning (may be empty string). Never throws.
+function sanitizeReasoning(reasoning) {
+  if (reasoning == null) return '';
+  const s = String(reasoning).trim();
+  if (s.length > MAX_REASONING_CHARS) return s.slice(0, MAX_REASONING_CHARS);
+  return s;
+}
+
+// Extract reasoning from a quizAnswers entry (the student sends [{ answer, reasoning }]).
+function reasoningFromQuizAnswer(quizAnswer) {
+  if (!quizAnswer || typeof quizAnswer !== 'object') return '';
+  return sanitizeReasoning(quizAnswer.reasoning);
+}
+
 // ── docx-to-pdf conversion (mammoth → HTML → puppeteer → PDF) ──────────────
 // Ported from ai-mentor/server/routes/quiz.js (2026-09-11, B05).
 // 2026-09-12: also returns structuredText (mammoth's HTML converted to
@@ -2129,6 +2148,29 @@ router.post('/:id/submit', clearNotificationsOnSuccess, async (req, res) => {
   if (fetchErr || !assignment) return res.status(404).json({ error: 'Assignment not found' });
   if (isPastDue(assignment.due_date)) return res.status(403).json({ error: 'This assignment closed on its due date and no longer accepts submissions.' });
 
+  // ── ENFORCE: require_reasoning (teacher setting) ────────────────────────────
+  // If the teacher set require_reasoning='required', every answered quiz question
+  // must include a non-empty reasoning string. Empty reasoning → reject with a
+  // clear message so the student knows to explain their thinking. Grading logic
+  // is untouched; this only gates submission acceptance.
+  const requireReasoning = assignment.require_reasoning || 'off';
+  if (requireReasoning === 'required' && Array.isArray(quizAnswers) && quizAnswers.length > 0) {
+    const missingReasoningIdx = quizAnswers.findIndex((a, i) => {
+      const q = (Array.isArray(submittedQuizQuestions) && submittedQuizQuestions[i]) || {};
+      // Only enforce on questions that actually have an answer.
+      const hasAnswer = !!(a && a.answer && String(a.answer).trim());
+      if (!hasAnswer) return false;
+      const reasoning = reasoningFromQuizAnswer(a);
+      return reasoning.length === 0;
+    });
+    if (missingReasoningIdx >= 0) {
+      return res.status(400).json({
+        error: 'Please explain your thinking for every question before submitting. Add a short reason under each question and try again.',
+        missingReasoningIndex: missingReasoningIdx,
+      });
+    }
+  }
+
   // ── ENFORCE: AI Auto-Grading (teacher setting) ───────────────────────────────
   // If the creating teacher turned OFF "AI Auto-Grading", the submission is saved
   // for manual review — NO AI score — instead of being auto-graded.
@@ -2144,9 +2186,13 @@ router.post('/:id/submit', clearNotificationsOnSuccess, async (req, res) => {
       ? pendingQuestions.map((q, i) => {
           const qText = typeof q === 'object' ? (q.question || '') : q;
           const studentAns = String((Array.isArray(quizAnswers) && quizAnswers[i]?.answer) || (Array.isArray(answers) && answers[i]) || '').trim();
-          return { number: i + 1, question: qText, studentAnswer: studentAns, answered: !!studentAns };
+          const reasoning = reasoningFromQuizAnswer(quizAnswers[i]);
+          return { number: i + 1, question: qText, studentAnswer: studentAns, answered: !!studentAns, ...(reasoning ? { reasoning } : {}) };
         })
-      : (Array.isArray(quizAnswers) ? quizAnswers.map((a, i) => ({ number: i + 1, question: '', studentAnswer: String(a?.answer || a || '').trim(), answered: true })) : []);
+      : (Array.isArray(quizAnswers) ? quizAnswers.map((a, i) => {
+          const reasoning = reasoningFromQuizAnswer(a);
+          return { number: i + 1, question: '', studentAnswer: String(a?.answer || a || '').trim(), answered: true, ...(reasoning ? { reasoning } : {}) };
+        }) : []);
     await supabase.from('assignment_submissions').upsert({
       assignment_id: id, student_id: studentUid,
       status: 'submitted', score: null,
@@ -2210,8 +2256,13 @@ router.post('/:id/submit', clearNotificationsOnSuccess, async (req, res) => {
             return { number: i+1, question: qText, answered: true, score: 50, correct: false, studentAnswer: studentAns, comment: 'Good effort!' };
           }
         }));
-        perQuestion = graded;
-        score = graded.length > 0 ? Math.round(graded.reduce((s, q) => s + q.score, 0) / graded.length) : 50;
+        // Inject student reasoning into each graded question (metadata only).
+        const gradedWithReasoning = graded.map((q, i) => {
+          const reasoning = reasoningFromQuizAnswer(quizAnswers[i]);
+          return reasoning ? { ...q, reasoning } : q;
+        });
+        perQuestion = gradedWithReasoning;
+        score = gradedWithReasoning.length > 0 ? Math.round(gradedWithReasoning.reduce((s, q) => s + q.score, 0) / gradedWithReasoning.length) : 50;
         try {
           const summaryComp = await groq.chat.completions.create({
             model: 'openai/gpt-oss-120b',
@@ -2219,8 +2270,8 @@ router.post('/:id/submit', clearNotificationsOnSuccess, async (req, res) => {
             response_format: { type: 'json_object' },
           });
           const sum = JSON.parse(summaryComp.choices[0].message.content);
-          feedback = JSON.stringify({ text: sum.text||'', stamp: sum.stamp||'Good Effort!', wellDone: sum.wellDone||'', improve: sum.improve||'', perQuestion: graded });
-        } catch { feedback = JSON.stringify({ text: 'Great effort!', stamp: score >= 80 ? 'Amazing Work!' : 'Good Effort!', perQuestion: graded }); }
+          feedback = JSON.stringify({ text: sum.text||'', stamp: sum.stamp||'Good Effort!', wellDone: sum.wellDone||'', improve: sum.improve||'', perQuestion: gradedWithReasoning });
+        } catch { feedback = JSON.stringify({ text: 'Great effort!', stamp: score >= 80 ? 'Amazing Work!' : 'Good Effort!', perQuestion: gradedWithReasoning }); }
 
         const studentUid = await resolveUserId(studentId);
         const { error: subErr } = await supabase.from('assignment_submissions').upsert({
@@ -2229,11 +2280,11 @@ router.post('/:id/submit', clearNotificationsOnSuccess, async (req, res) => {
           // GET /:id/submissions reads answers from submission_text, not ai_feedback
           // (even though feedback also embeds perQuestion) — without this, the
           // teacher's per-student detail view showed a score but no answers.
-          submission_text: JSON.stringify({ perQuestion: graded }),
+          submission_text: JSON.stringify({ perQuestion: gradedWithReasoning }),
           completed_at: new Date().toISOString(),
         }, { onConflict: 'assignment_id,student_id' });
         if (subErr) return res.status(500).json({ error: subErr.message });
-        return res.json({ score, feedback, perQuestion: graded });
+        return res.json({ score, feedback, perQuestion: gradedWithReasoning });
       }
 
       if (quizQuestions.length === 0) {
@@ -2388,14 +2439,20 @@ Respond ONLY as JSON: {"score":0-100,"correct":bool,"comment":"one warm, specifi
         }
       }));
 
-      perQuestion = graded;
-      const answeredCount = graded.filter(q => q.answered).length;
-      const correctCount  = graded.filter(q => q.correct).length;
+      // Inject student reasoning into each graded question (metadata only —
+      // never affects score/correct). Pull from quizAnswers[i].reasoning.
+      const gradedWithReasoning = graded.map((q, i) => {
+        const reasoning = reasoningFromQuizAnswer(quizAnswers[i]);
+        return reasoning ? { ...q, reasoning } : q;
+      });
+      perQuestion = gradedWithReasoning;
+      const answeredCount = gradedWithReasoning.filter(q => q.answered).length;
+      const correctCount  = gradedWithReasoning.filter(q => q.correct).length;
       // B04: needsReview entries (score: null, AI grading itself failed) are
       // excluded from the average - folding null in (coerces to 0 in a sum)
       // would silently misrepresent the student's real performance on the
       // questions that DID grade successfully.
-      const scorable = graded.filter(q => !q.needsReview);
+      const scorable = gradedWithReasoning.filter(q => !q.needsReview);
       score = scorable.length > 0 ? Math.round(scorable.reduce((s, q) => s + q.score, 0) / scorable.length) : 0;
 
       try {
@@ -2736,18 +2793,23 @@ Respond ONLY as JSON: {"text":"...student-facing...","teacherSummary":"...teache
           return { number: i+1, question: qText, answered: true, score: 50, correct: false, studentAnswer: studentAns, comment: 'Good effort!' };
         }
       }));
-      perQuestion = graded;
-      const answeredGraded = graded.filter(q => q.answered);
-      score = answeredGraded.length > 0 ? Math.round(answeredGraded.reduce((s, q) => s + q.score, 0) / graded.length) : 0;
+      // Inject student reasoning into each graded question (metadata only).
+      const gradedWithReasoning = graded.map((q, i) => {
+        const reasoning = reasoningFromQuizAnswer(quizAnswers[i]);
+        return reasoning ? { ...q, reasoning } : q;
+      });
+      perQuestion = gradedWithReasoning;
+      const answeredGraded = gradedWithReasoning.filter(q => q.answered);
+      score = answeredGraded.length > 0 ? Math.round(answeredGraded.reduce((s, q) => s + q.score, 0) / gradedWithReasoning.length) : 0;
       try {
         const summaryComp = await groq.chat.completions.create({
           model: 'openai/gpt-oss-120b',
-          messages: [{ role: 'user', content: `IB PYP ${assignment.grade||'Grade 3'} student scored ${score}% on "${assignment.title}" (${assignment.subject}). ${answeredGraded.length}/${graded.length} questions answered. Write 2 warm encouraging sentences for a young learner. JSON: {"text":"...","stamp":"Amazing Work! or Good Effort! or Keep Trying!","wellDone":"...","improve":"..."}` }],
+          messages: [{ role: 'user', content: `IB PYP ${assignment.grade||'Grade 3'} student scored ${score}% on "${assignment.title}" (${assignment.subject}). ${answeredGraded.length}/${gradedWithReasoning.length} questions answered. Write 2 warm encouraging sentences for a young learner. JSON: {"text":"...","stamp":"Amazing Work! or Good Effort! or Keep Trying!","wellDone":"...","improve":"..."}` }],
           response_format: { type: 'json_object' },
         });
         const sum = JSON.parse(summaryComp.choices[0].message.content);
-        feedback = JSON.stringify({ text: sum.text||'', stamp: sum.stamp||'Good Effort!', wellDone: sum.wellDone||'', improve: sum.improve||'', perQuestion: graded });
-      } catch { feedback = JSON.stringify({ text: 'Great effort!', stamp: score >= 80 ? 'Amazing Work!' : score >= 60 ? 'Good Effort!' : 'Keep Trying!', perQuestion: graded }); }
+        feedback = JSON.stringify({ text: sum.text||'', stamp: sum.stamp||'Good Effort!', wellDone: sum.wellDone||'', improve: sum.improve||'', perQuestion: gradedWithReasoning });
+      } catch { feedback = JSON.stringify({ text: 'Great effort!', stamp: score >= 80 ? 'Amazing Work!' : score >= 60 ? 'Good Effort!' : 'Keep Trying!', perQuestion: gradedWithReasoning }); }
 
       // Save submission
       const studentUid = await resolveUserId(studentId);
@@ -2757,7 +2819,7 @@ Respond ONLY as JSON: {"text":"...student-facing...","teacherSummary":"...teache
         status: 'completed', score, ai_feedback: feedback, completed_at: new Date().toISOString(),
         submission_text: submissionText,
       }, { onConflict: 'assignment_id,student_id' });
-      return res.json({ score, aiFeedback: feedback, perQuestion: graded });
+      return res.json({ score, aiFeedback: feedback, perQuestion: gradedWithReasoning });
 
     } else if (Array.isArray(questionImages) && questionImages.length > 0) {
       // Worksheet image grading flow
