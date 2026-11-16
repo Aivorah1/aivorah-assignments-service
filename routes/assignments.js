@@ -327,6 +327,7 @@ function normalise(a, branding) {
     learnerProfile:   a.learner_profile || null,
     atlSkill:         a.atl_skill || null,
     keyConcept:       a.key_concept || null,
+    requireReasoning: a.require_reasoning || 'off',
     // Regenerate the interactive quiz HTML live from the stored quiz JSON on every
     // read, rather than trusting the frozen `interactive_quiz_html` snapshot taken
     // at creation time. Otherwise every template fix (e.g. the missing Submit
@@ -1181,6 +1182,7 @@ router.post('/', async (req, res) => {
       centralIdea = null, linesOfInquiry = [], learnerProfile = null, atlSkill = null, keyConcept = null,
       questionAnswers = {}, teacherComments = [],
       interactiveQuiz = null, interactiveQuizHtml = null,
+      requireReasoning = 'off',
     } = req.body;
 
     if (!title || !dueDate) return res.status(400).json({ error: 'title and dueDate required' });
@@ -1317,6 +1319,7 @@ router.post('/', async (req, res) => {
         learner_profile:  learnerProfile || null,
         atl_skill:        atlSkill || null,
         key_concept:      keyConcept || null,
+        require_reasoning: requireReasoning,
         interactive_quiz: interactiveQuiz || null,
         interactive_quiz_html: finalQuizHtml,
       })
@@ -3213,6 +3216,7 @@ router.get('/:id/submissions', async (req, res) => {
 
 // ── PUT /assignments/:id/teacher-feedback ──
 // Teacher sends feedback on a student's submission. Visible to student + parent.
+// Supports BOTH overall feedback AND per-question comments.
 // Ported verbatim from ai-mentor/server/routes/assignments.js (2026-08-25) —
 // self-contained (only touches supabase + resolveUserId, already present
 // here), no dependency on the teacher-side generation pipeline that kept
@@ -3220,8 +3224,8 @@ router.get('/:id/submissions', async (req, res) => {
 router.put('/:id/teacher-feedback', async (req, res) => {
   try {
     const { id } = req.params;
-    const { studentId, feedback } = req.body;
-    if (!studentId || !feedback) return res.status(400).json({ error: 'studentId and feedback required' });
+    const { studentId, feedback, perQuestionComments } = req.body;
+    if (!studentId) return res.status(400).json({ error: 'studentId required' });
 
     const userId = await resolveUserId(studentId);
     if (!userId) return res.status(400).json({ error: 'Student not found' });
@@ -3237,12 +3241,30 @@ router.put('/:id/teacher-feedback', async (req, res) => {
     // Merge teacher feedback into ai_feedback JSON
     let feedbackObj = {};
     try { feedbackObj = JSON.parse(sub?.ai_feedback || '{}'); } catch { feedbackObj = { text: sub?.ai_feedback || '' }; }
-    const previous = feedbackObj.teacherFeedback || '';
-    const isEdit = !!previous;
     const now = new Date().toISOString();
-    feedbackObj.teacherFeedback = feedback;
-    if (isEdit) feedbackObj.teacherFeedbackEditedAt = now;
-    else feedbackObj.teacherFeedbackAt = now;
+
+    // Overall feedback (optional — teacher may skip)
+    if (typeof feedback === 'string') {
+      const previous = feedbackObj.teacherFeedback || '';
+      const isEdit = !!previous;
+      feedbackObj.teacherFeedback = feedback;
+      if (isEdit) feedbackObj.teacherFeedbackEditedAt = now;
+      else feedbackObj.teacherFeedbackAt = now;
+    }
+
+    // Per-question comments (optional — teacher may comment on specific questions only)
+    if (Array.isArray(perQuestionComments) && perQuestionComments.length > 0) {
+      feedbackObj.perQuestionComments = feedbackObj.perQuestionComments || [];
+      // Merge: update existing comments by question number, add new ones
+      const commentMap = new Map();
+      (feedbackObj.perQuestionComments || []).forEach(c => commentMap.set(c.number, c));
+      perQuestionComments.forEach(c => {
+        if (c && typeof c.number === 'number' && typeof c.comment === 'string') {
+          commentMap.set(c.number, { number: c.number, comment: c.comment, commentedAt: now });
+        }
+      });
+      feedbackObj.perQuestionComments = Array.from(commentMap.values());
+    }
 
     const { error } = await supabase
       .from('assignment_submissions')
@@ -3253,11 +3275,13 @@ router.put('/:id/teacher-feedback', async (req, res) => {
     if (error) return res.status(500).json({ error: error.message });
 
     // Bell notification for the student + parents; each send/edit is its own event.
-    if (String(previous).trim() !== String(feedback).trim()) {
+    const previousOverall = sub?.ai_feedback ? (() => { try { return JSON.parse(sub.ai_feedback).teacherFeedback || ''; } catch { return ''; } })() : '';
+    const hasChanges = String(previousOverall).trim() !== String(feedback || '').trim() || (Array.isArray(perQuestionComments) && perQuestionComments.length > 0);
+    if (hasChanges) {
       const { data: assignment } = await supabase
         .from('assignments').select('id, title, subject, type').eq('id', id).maybeSingle();
       await createNotificationEvent(assignmentFeedbackEvent(assignment || { id }, {
-        studentId: userId, feedback, version: now, edited: isEdit,
+        studentId: userId, feedback: feedback || '', version: now, edited: !!previousOverall,
         actorEmail: req.body.teacherEmail ? String(req.body.teacherEmail).toLowerCase() : null,
       }));
     }
