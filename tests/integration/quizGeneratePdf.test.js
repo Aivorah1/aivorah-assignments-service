@@ -184,7 +184,13 @@ describe('POST /quiz/generate — structuredText ground truth (docx table-halluc
   beforeAll(() => { app = require('../../index'); });
   beforeEach(() => mockGenerateContent.mockReset());
 
-  test('a real Groq call given structuredText from a fraction table returns the EXACT source fractions, not fabricated ones', async () => {
+  // This one calls the real Groq API, so it needs a real key (from .env or the
+  // environment; jest.setup.js puts in 'test-fake-key' otherwise). Without one
+  // (e.g. CI) it is skipped, not failed.
+  const groqKey = (jest.requireActual('dotenv').config().parsed || {}).GROQ_API_KEY || process.env.GROQ_API_KEY;
+  const withGroqKey = groqKey && groqKey !== 'test-fake-key' ? test : test.skip;
+
+  withGroqKey('a real Groq call given structuredText from a fraction table returns the EXACT source fractions, not fabricated ones', async () => {
     mockGenerateContent.mockRejectedValue(new Error('429 Too Many Requests: daily quota exceeded'));
     // groq-sdk is mocked at module scope in this file - proxy the mock
     // through to the REAL SDK/API for this one test, since the whole
