@@ -108,8 +108,17 @@ cloudinary.config({
 const MCQ_LETTER_TO_INDEX = { A: 0, B: 1, C: 2, D: 3 };
 
 // ── Student reasoning ("Why did you choose this answer?") ───────────────────
-// Max characters for a student's reasoning text (per question).
-const MAX_REASONING_CHARS = 500;
+// No word or character limit for students: this only guards the database
+// against a runaway paste (about 3,000 words).
+const MAX_REASONING_CHARS = 20000;
+
+// The teacher's "Why did you choose this?" setting for an assignment.
+const REASONING_SETTINGS = ['off', 'optional', 'required'];
+function readRequireReasoning(value) {
+  const v = String(value || '').trim().toLowerCase();
+  if (v === 'compulsory') return 'required';
+  return REASONING_SETTINGS.includes(v) ? v : 'off';
+}
 
 // Sanitise a single reasoning string: coerce to string, trim, cap length.
 // Returns the cleaned reasoning (may be empty string). Never throws.
@@ -327,6 +336,7 @@ function normalise(a, branding) {
     learnerProfile:   a.learner_profile || null,
     atlSkill:         a.atl_skill || null,
     keyConcept:       a.key_concept || null,
+    requireReasoning: readRequireReasoning(a.require_reasoning),
     // Regenerate the interactive quiz HTML live from the stored quiz JSON on every
     // read, rather than trusting the frozen `interactive_quiz_html` snapshot taken
     // at creation time. Otherwise every template fix (e.g. the missing Submit
@@ -1181,6 +1191,7 @@ router.post('/', async (req, res) => {
       centralIdea = null, linesOfInquiry = [], learnerProfile = null, atlSkill = null, keyConcept = null,
       questionAnswers = {}, teacherComments = [],
       interactiveQuiz = null, interactiveQuizHtml = null,
+      requireReasoning = 'off',
     } = req.body;
 
     if (!title || !dueDate) return res.status(400).json({ error: 'title and dueDate required' });
@@ -1273,9 +1284,7 @@ router.post('/', async (req, res) => {
       }
     }
 
-    const { data, error } = await supabase
-      .from('assignments')
-      .insert({
+    const insertRow = {
         title, subject, chapter,
         // `assignments` has no start_date column (confirmed absent in both
         // Dev and Test Supabase projects) — inserting it always threw
@@ -1319,9 +1328,17 @@ router.post('/', async (req, res) => {
         key_concept:      keyConcept || null,
         interactive_quiz: interactiveQuiz || null,
         interactive_quiz_html: finalQuizHtml,
-      })
-      .select()
-      .single();
+        // "Why did you choose this?" under each question: off / optional / required (migration 0028)
+        require_reasoning: readRequireReasoning(requireReasoning),
+    };
+    let { data, error } = await supabase.from('assignments').insert(insertRow).select().single();
+    // A database without migration 0028 has no require_reasoning column:
+    // still publish the assignment (without the setting) instead of failing.
+    if (error && /require_reasoning/.test(error.message || '')) {
+      console.warn('[assignments] require_reasoning column missing (apply aivorah-db 0028); saved without it');
+      const { require_reasoning: _skip, ...withoutSetting } = insertRow;
+      ({ data, error } = await supabase.from('assignments').insert(withoutSetting).select().single());
+    }
 
     if (error) return res.status(500).json({ error: error.message });
 
@@ -2156,10 +2173,8 @@ router.post('/:id/submit', clearNotificationsOnSuccess, async (req, res) => {
   const requireReasoning = assignment.require_reasoning || 'off';
   if (requireReasoning === 'required' && Array.isArray(quizAnswers) && quizAnswers.length > 0) {
     const missingReasoningIdx = quizAnswers.findIndex((a, i) => {
-      const q = (Array.isArray(submittedQuizQuestions) && submittedQuizQuestions[i]) || {};
-      // The student app shows no reasoning box for fill-in-the-blank
-      // questions, so they can't be required to have one.
-      if (q.type === 'fill_blank') return false;
+      // Multiple choice and fill-in-the-blank both have the box ("Why did
+      // you write this answer?"), so both need a reason when required.
       // Only enforce on questions that actually have an answer.
       const hasAnswer = !!(a && a.answer && String(a.answer).trim());
       if (!hasAnswer) return false;

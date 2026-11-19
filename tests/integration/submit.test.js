@@ -283,17 +283,41 @@ describe('POST /assignments/:id/submit — required reasoning', () => {
     expect(res.body.missingReasoningIndex).toBe(0);
   });
 
-  test('a fill-in-the-blank answer needs no reason (the student app shows no reason box for it)', async () => {
+  test('a fill-in-the-blank answer needs a reason too ("Why did you write this answer?")', async () => {
+    mockSb.setTable('assignments', { data: baseAssignmentRow({ quiz_questions: [FILL_Q], require_reasoning: 'required' }), error: null });
+
+    const res = await request(app).post('/assignments/a1/submit').send({
+      studentId: STUDENT_UUID, quizQuestions: [FILL_Q], quizAnswers: [{ answer: '[attempt:1] Paris', reasoning: '  ' }],
+    });
+
+    expect(res.status).toBe(400);
+    expect(res.body.missingReasoningIndex).toBe(0);
+  });
+
+  test('a fill-in-the-blank answer with a reason is graded and keeps the reason', async () => {
     const row = baseAssignmentRow({ quiz_questions: [FILL_Q], require_reasoning: 'required' });
     mockSb.setTable('assignments', [{ data: row, error: null }, { data: row, error: null }]);
     mockSb.setTable('assignment_submissions', { data: {}, error: null });
     mockGroqCreate.mockResolvedValue(groqJson({ text: 'Perfect!' }));
 
     const res = await request(app).post('/assignments/a1/submit').send({
-      studentId: STUDENT_UUID, quizQuestions: [FILL_Q], quizAnswers: [{ answer: '[attempt:1] Paris' }],
+      studentId: STUDENT_UUID, quizQuestions: [FILL_Q], quizAnswers: [{ answer: '[attempt:1] Paris', reasoning: 'It is the capital city.' }],
     });
 
     expect(res.status).toBe(200);
     expect(res.body.perQuestion[0].score).toBe(100);
+    expect(res.body.perQuestion[0].reasoning).toBe('It is the capital city.');
+  });
+
+  test('"optional": no reason is fine', async () => {
+    const row = baseAssignmentRow({ quiz_questions: [MCQ_Q], require_reasoning: 'optional' });
+    mockSb.setTable('assignments', [{ data: row, error: null }, { data: row, error: null }]);
+    mockSb.setTable('assignment_submissions', { data: {}, error: null });
+    mockGroqCreate.mockResolvedValue(groqJson({ text: 'Good!' }));
+
+    const res = await request(app).post('/assignments/a1/submit').send({
+      studentId: STUDENT_UUID, quizQuestions: [MCQ_Q], quizAnswers: [{ answer: 'Four', reasoning: '' }],
+    });
+    expect(res.status).toBe(200);
   });
 });
