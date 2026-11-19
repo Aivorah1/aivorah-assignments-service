@@ -2157,6 +2157,9 @@ router.post('/:id/submit', clearNotificationsOnSuccess, async (req, res) => {
   if (requireReasoning === 'required' && Array.isArray(quizAnswers) && quizAnswers.length > 0) {
     const missingReasoningIdx = quizAnswers.findIndex((a, i) => {
       const q = (Array.isArray(submittedQuizQuestions) && submittedQuizQuestions[i]) || {};
+      // The student app shows no reasoning box for fill-in-the-blank
+      // questions, so they can't be required to have one.
+      if (q.type === 'fill_blank') return false;
       // Only enforce on questions that actually have an answer.
       const hasAnswer = !!(a && a.answer && String(a.answer).trim());
       if (!hasAnswer) return false;
@@ -3220,8 +3223,18 @@ router.get('/:id/submissions', async (req, res) => {
 router.put('/:id/teacher-feedback', async (req, res) => {
   try {
     const { id } = req.params;
-    const { studentId, feedback } = req.body;
-    if (!studentId || !feedback) return res.status(400).json({ error: 'studentId and feedback required' });
+    const { studentId } = req.body;
+    // Overall feedback and per-question comments are each optional, but a
+    // request must carry at least one of them. The teacher portal sends
+    // per-question comments as [{ number, comment }].
+    const feedback = typeof req.body.feedback === 'string' ? req.body.feedback.trim() : '';
+    const perQuestionComments = (Array.isArray(req.body.perQuestionComments) ? req.body.perQuestionComments : [])
+      .filter(c => c && Number.isInteger(c.number) && c.number > 0 && typeof c.comment === 'string')
+      .map(c => ({ number: c.number, comment: c.comment.trim().slice(0, 1000) }));
+    if (!studentId) return res.status(400).json({ error: 'studentId required' });
+    if (!feedback && perQuestionComments.length === 0) {
+      return res.status(400).json({ error: 'feedback or perQuestionComments required' });
+    }
 
     const userId = await resolveUserId(studentId);
     if (!userId) return res.status(400).json({ error: 'Student not found' });
@@ -3240,9 +3253,33 @@ router.put('/:id/teacher-feedback', async (req, res) => {
     const previous = feedbackObj.teacherFeedback || '';
     const isEdit = !!previous;
     const now = new Date().toISOString();
-    feedbackObj.teacherFeedback = feedback;
-    if (isEdit) feedbackObj.teacherFeedbackEditedAt = now;
-    else feedbackObj.teacherFeedbackAt = now;
+    const feedbackChanged = !!feedback && String(previous).trim() !== feedback;
+    if (feedback) {
+      feedbackObj.teacherFeedback = feedback;
+      if (isEdit) feedbackObj.teacherFeedbackEditedAt = now;
+      else feedbackObj.teacherFeedbackAt = now;
+    }
+
+    // Merge per-question comments by question number; an empty comment
+    // removes that question's comment.
+    let commentsChanged = false;
+    const addedNumbers = [];
+    if (perQuestionComments.length > 0) {
+      const byNumber = new Map();
+      (Array.isArray(feedbackObj.perQuestionComments) ? feedbackObj.perQuestionComments : [])
+        .forEach(c => { if (c && Number.isInteger(c.number)) byNumber.set(c.number, c); });
+      for (const c of perQuestionComments) {
+        const old = byNumber.get(c.number);
+        if (!c.comment) {
+          if (old) { byNumber.delete(c.number); commentsChanged = true; }
+        } else if (!old || old.comment !== c.comment) {
+          byNumber.set(c.number, { number: c.number, comment: c.comment, commentedAt: now });
+          commentsChanged = true;
+          addedNumbers.push(c.number);
+        }
+      }
+      feedbackObj.perQuestionComments = [...byNumber.values()].sort((x, y) => x.number - y.number);
+    }
 
     const { error } = await supabase
       .from('assignment_submissions')
@@ -3253,11 +3290,14 @@ router.put('/:id/teacher-feedback', async (req, res) => {
     if (error) return res.status(500).json({ error: error.message });
 
     // Bell notification for the student + parents; each send/edit is its own event.
-    if (String(previous).trim() !== String(feedback).trim()) {
+    if (feedbackChanged || addedNumbers.length > 0) {
       const { data: assignment } = await supabase
         .from('assignments').select('id, title, subject, type').eq('id', id).maybeSingle();
+      const notifyText = feedbackChanged
+        ? feedback
+        : `Your teacher commented on question${addedNumbers.length > 1 ? 's' : ''} ${addedNumbers.join(', ')}`;
       await createNotificationEvent(assignmentFeedbackEvent(assignment || { id }, {
-        studentId: userId, feedback, version: now, edited: isEdit,
+        studentId: userId, feedback: notifyText, version: now, edited: feedbackChanged ? isEdit : false,
         actorEmail: req.body.teacherEmail ? String(req.body.teacherEmail).toLowerCase() : null,
       }));
     }

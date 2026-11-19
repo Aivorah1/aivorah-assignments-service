@@ -179,3 +179,60 @@ describe('PUT /assignments/:id/teacher-feedback', () => {
     expect(res.body.error).toBe('save failed');
   });
 });
+
+describe('PUT /assignments/:id/teacher-feedback — per-question comments', () => {
+  test('per-question comments alone (no overall feedback) are saved and keep the existing feedback', async () => {
+    mockSb.setTable('assignment_submissions', [
+      { data: { ai_feedback: JSON.stringify({ text: 'Nice', teacherFeedback: 'Good work' }) }, error: null },
+      { data: null, error: null },
+    ]);
+    mockSb.setTable('assignments', { data: { id: 'a1', title: 'Fractions', type: 'assignment' }, error: null });
+    mockSb.setTable('rpc:notify_event', { data: { inserted: [] }, error: null });
+    mockSb.supabase.rpc.mockClear();
+    const logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
+
+    const res = await request(app).put('/assignments/a1/teacher-feedback').send({
+      studentId: STUDENT_UUID, feedback: '',
+      perQuestionComments: [{ number: 2, comment: ' Check the denominator ' }],
+    });
+    logSpy.mockRestore();
+
+    expect(res.status).toBe(200);
+    expect(res.body.feedback.teacherFeedback).toBe('Good work');
+    expect(res.body.feedback.teacherFeedbackEditedAt).toBeUndefined();
+    expect(res.body.feedback.perQuestionComments).toEqual([
+      { number: 2, comment: 'Check the denominator', commentedAt: expect.any(String) },
+    ]);
+    const evt = mockSb.supabase.rpc.mock.calls.at(-1)[1].p_event;
+    expect(evt.body).toBe('Your teacher commented on question 2');
+  });
+
+  test('merges with saved comments by question number; an empty comment removes one', async () => {
+    mockSb.setTable('assignment_submissions', [
+      { data: { ai_feedback: JSON.stringify({ perQuestionComments: [
+        { number: 1, comment: 'Old one', commentedAt: '2026-10-01T00:00:00.000Z' },
+        { number: 3, comment: 'Keep me', commentedAt: '2026-10-01T00:00:00.000Z' },
+      ] }) }, error: null },
+      { data: null, error: null },
+    ]);
+    mockSb.supabase.rpc.mockClear();
+
+    const res = await request(app).put('/assignments/a1/teacher-feedback').send({
+      studentId: STUDENT_UUID,
+      perQuestionComments: [{ number: 1, comment: '' }, { number: 3, comment: 'Keep me' }],
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.feedback.perQuestionComments).toEqual([
+      { number: 3, comment: 'Keep me', commentedAt: '2026-10-01T00:00:00.000Z' },
+    ]);
+    // Only a removal, nothing new to tell the student about.
+    expect(mockSb.supabase.rpc).not.toHaveBeenCalled();
+  });
+
+  test('neither feedback nor comments is a 400', async () => {
+    const res = await request(app).put('/assignments/a1/teacher-feedback')
+      .send({ studentId: STUDENT_UUID, feedback: '  ', perQuestionComments: [] });
+    expect(res.status).toBe(400);
+  });
+});
