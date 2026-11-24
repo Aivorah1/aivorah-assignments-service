@@ -608,56 +608,13 @@ async function callGeminiVision(parts, { grade, subject, school, structuredText 
   return geminiGenerate(model, [...parts, { text: prompt }]);
 }
 
-// ── Qwen 2.5-VL-72B Vision (via HuggingFace router) — fallback when Gemini
-// fails ─────────────────────────────────────────────────────────────────
-// Live-verified 2026-09-11: this key/model responds successfully right now,
-// unlike the only available Gemini key (depleted). Image-only for now (no
-// PDF support — HF's chat-completions API takes image_url data URIs, not a
-// native PDF part like Gemini's inlineData); PDF generation stays
-// Gemini-only until page rasterization is added (see
-// QUIZ_PIPELINE_MIGRATION.md).
-const HF_TOKEN = process.env.HF_TOKEN;
-const QWEN_VISION_MODEL = 'Qwen/Qwen2.5-VL-72B-Instruct';
-
-// Generic Qwen vision call with an arbitrary prompt — used both by
-// callQwenVision (quiz-generation prompt) and by other vision fallbacks
-// (e.g. worksheet metadata/text extraction) that need their own prompt.
-async function callQwenVisionRaw(imageBuffer, mime, prompt) {
-  if (!HF_TOKEN) throw new Error('HF_TOKEN not configured');
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 90000);
-  try {
-    const res = await fetch('https://router.huggingface.co/v1/chat/completions', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${HF_TOKEN}`, 'Content-Type': 'application/json' },
-      signal: controller.signal,
-      body: JSON.stringify({
-        model: QWEN_VISION_MODEL,
-        messages: [{
-          role: 'user',
-          content: [
-            { type: 'image_url', image_url: { url: `data:${mime || 'image/png'};base64,${imageBuffer.toString('base64')}` } },
-            { type: 'text', text: prompt },
-          ],
-        }],
-        max_tokens: 8192,
-        temperature: 0.3,
-      }),
-    });
-    if (!res.ok) {
-      const body = await res.text();
-      throw new Error(`HF router ${res.status}: ${body.slice(0, 200)}`);
-    }
-    const json = await res.json();
-    return json.choices?.[0]?.message?.content || '';
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-async function callQwenVision(imageBuffer, mime, { grade, subject, school } = {}) {
-  const prompt = buildQuizVisionPrompt({ grade, subject, school });
-  return callQwenVisionRaw(imageBuffer, mime, prompt);
+// ── Groq vision with an arbitrary prompt (one image) ──────────────────────
+// The second picture reader after Gemini, on the same Groq account as the
+// text model. Replaces the Hugging Face (Qwen) and Mistral hops, removed
+// 2026-11-24: only Gemini and Groq are used.
+async function callGroqVisionRaw(imageBuffer, mime, prompt, opts = {}) {
+  const { callGroqVision } = require('./worksheet/providers');
+  return callGroqVision([{ buffer: imageBuffer, mime: mime || 'image/png' }], prompt, opts);
 }
 
 function parseQuizResponse(raw) {
@@ -1295,13 +1252,12 @@ async function callGroqWithText(promptText, { maxTokens = 16000 } = {}) {
   }
 }
 
-// Qwen used ONLY for OCR (its strength), not full structured extraction
-// (its weakness, per the finding above): transcribe the worksheet's
-// visible text as plainly as possible, then hand that text to Groq (see
-// buildQuizFromWorksheetText) to do the actual quiz-structuring work.
-async function callQwenOcrText(imageBuffer, mime) {
-  return callQwenVisionRaw(imageBuffer, mime,
-    'Transcribe ALL text visible in this worksheet image, exactly as printed, preserving the order top-to-bottom and left-to-right - headings, instructions, every numbered/lettered item, and any text inside diagrams or tables. Do not summarize, translate, explain, or add anything. Output ONLY the raw transcribed text.');
+// Groq vision used only to transcribe a page when local OCR fails; Groq's
+// text model then structures the quiz (buildQuizFromWorksheetText).
+async function callGroqVisionOcrText(imageBuffer, mime) {
+  return callGroqVisionRaw(imageBuffer, mime,
+    'Transcribe ALL text visible in this worksheet image, exactly as printed, preserving the order top-to-bottom and left-to-right - headings, instructions, every numbered/lettered item, and any text inside diagrams or tables. Do not summarize, translate, explain, or add anything. Output ONLY the raw transcribed text.',
+    { maxTokens: 8000 });
 }
 
 // ── Tesseract.js OCR — for Telugu/Indic-script content, added 2026-09-12 ──
@@ -1365,34 +1321,20 @@ async function callTesseractOcrText(imageBuffer, lang) {
   return text || '';
 }
 
-// OCR router - Tesseract is now PRIMARY for every script, English
-// included, with Qwen as an opportunistic secondary. Changed 2026-09-12
-// after live testing found Qwen's HuggingFace router returning
-// "You have depleted your monthly included credits" in production - an
-// availability failure, not just the Telugu accuracy problem found
-// earlier. Tesseract has no quota/billing dependency at all (local WASM),
-// and was independently verified highly accurate on a real English
-// worksheet fixture in the same test pass (correctly read task titles,
-// numeric measurements, and instructions - only minor noise on a
-// diagram-heavy region, not on real text). Qwen is kept as a secondary
-// only in case Tesseract itself fails on a given image; if Qwen's quota
-// is still depleted when that happens, callOcrText simply throws instead
-// of silently returning nothing, which is the correct behavior per the
-// "OCR failure must be handled safely" requirement - a genuinely bad
-// result should fail visibly, not produce a confident wrong quiz.
+// OCR router: Tesseract (local, no account, every script) first; Groq
+// vision transcription only if Tesseract fails on this image. A genuinely
+// unreadable page fails visibly instead of producing a confident wrong quiz.
 async function callOcrText(imageBuffer, mime) {
   const lang = await detectScriptLang(imageBuffer);
-  const primary = () => callTesseractOcrText(imageBuffer, lang);
-  const secondary = () => callQwenOcrText(imageBuffer, mime);
   try {
-    return (await primary()).trim();
+    return (await callTesseractOcrText(imageBuffer, lang)).trim();
   } catch (tesseractErr) {
     classifyProviderError('tesseract', tesseractErr);
     try {
-      return (await secondary()).trim();
-    } catch (qwenErr) {
-      classifyProviderError('qwen', qwenErr);
-      throw qwenErr;
+      return (await callGroqVisionOcrText(imageBuffer, mime)).trim();
+    } catch (groqErr) {
+      classifyProviderError('groq-vision', groqErr);
+      throw groqErr;
     }
   }
 }
@@ -1524,7 +1466,7 @@ async function generateQuizFromPdf(pdfBuffer, { grade, subject, school, structur
 // 1. Document model (no AI): per-page text layer + OCR + pictures placed
 //    inline (services/worksheet/documentModel.js).
 // 2. First provider that answers, each given that transcript as ground truth:
-//    Gemini vision (whole PDF/image) → Mistral vision (page images) → Groq
+//    Gemini vision (whole PDF/image) → Groq vision (page images) → Groq
 //    text (transcript only). Only the last is "text-only".
 // 3. The same post-processing for every provider.
 // Root cause this replaces (2026-10-13): with Gemini unavailable every
@@ -1532,7 +1474,7 @@ async function generateQuizFromPdf(pdfBuffer, { grade, subject, school, structur
 // skipped OCR when it had ≥300 chars, OCR'd a stitched ~108dpi strip, and
 // listed pictures without positions — ~20% of real worksheets converted.
 const DOCUMENT_MODEL_TIMEOUT_MS = parseInt(process.env.DOCUMENT_MODEL_TIMEOUT_MS || '150000', 10);
-// With a second vision provider that is actually answering, a slow Gemini
+// With Groq vision answering as the second picture reader, a slow Gemini
 // isn't worth waiting out (its retries back off for up to GEMINI_VISION_TIMEOUT_MS).
 const GEMINI_TIMEOUT_WITH_FALLBACK_MS = parseInt(process.env.GEMINI_TIMEOUT_WITH_FALLBACK_MS || '30000', 10);
 // Total time the worksheet job keeps trying to READ the pages with a vision
@@ -1554,10 +1496,10 @@ function shortProviderError(err) {
   return msg.replace(/\[GoogleGenerativeAI Error\]:\s*/g, '').replace(/Error fetching from \S+?:\s*/g, '').replace(/[[\]]/g, '').slice(0, 160);
 }
 
-const PROVIDER_LABELS = { gemini: 'Gemini', mistral: 'Mistral' };
+const PROVIDER_LABELS = { gemini: 'Gemini', 'groq-vision': 'Groq vision' };
 const STATUS_WORDS = {
   RATE_LIMITED: 'is rate-limited', QUOTA_EXHAUSTED: 'is out of quota', AUTH_FAILURE: 'rejected the API key',
-  DISABLED: 'is not configured', TEMPORARY_FAILURE: 'was overloaded or timed out',
+  DISABLED: 'is not configured', TEMPORARY_FAILURE: 'was overloaded, timed out or gave an unusable answer',
 };
 // One sentence a teacher can act on: why the pages couldn't be read with vision.
 function describeVisionFailure(attempts) {
@@ -1580,7 +1522,7 @@ async function buildWorksheetDocument({ buffer, mime, structuredText, hints }) {
 }
 
 async function generateQuizFromDocument({ buffer, mime, grade, subject, school, structuredText, language, visionBudgetMs = VISION_TOTAL_BUDGET_MS } = {}) {
-  const { callMistralVision, transcriptBlock } = require('./worksheet/providers');
+  const { callGroqVision, transcriptBlock } = require('./worksheet/providers');
   const isPdf = /pdf/i.test(mime || '');
   const doc = await buildWorksheetDocument({ buffer, mime, structuredText, hints: [language, subject] });
   const transcript = doc && doc.text ? doc.text : (structuredText || '');
@@ -1616,34 +1558,42 @@ async function generateQuizFromDocument({ buffer, mime, grade, subject, school, 
     }
   };
 
-  // Mistral: looks at the rendered pages.
+  // Groq vision: looks at the rendered pages (same Groq account as the text model).
   const pageImages = doc && doc.pageImages.length ? doc.pageImages : (!isPdf ? [{ buffer, mime }] : []);
-  const mistralUsable = () => !!process.env.MISTRAL_API_KEY && pageImages.length > 0 && !isProviderCoolingDown('mistral');
-  const tryMistral = async () => {
-    if (provider || !mistralUsable()) return;
+  const groqVisionUsable = () => !!process.env.GROQ_API_KEY && pageImages.length > 0 && !isProviderCoolingDown('groq-vision');
+  const labelledTasks = countLabelledTaskHeadings(transcript);
+  const tryGroqVision = async () => {
+    if (provider || !groqVisionUsable()) return;
     const started = Date.now();
     try {
       const prompt = basePrompt + transcriptBlock(transcript, { canSeePages: true });
-      raw = await callMistralVision(pageImages, prompt);
-      retryFn = (retryPrompt) => callMistralVision(pageImages, retryPrompt + transcriptBlock(transcript, { canSeePages: true }));
-      provider = 'mistral';
-      markProviderResult('mistral', 'OK');
-    } catch (mistralErr) {
-      const status = classifyProviderError('mistral', mistralErr);
-      visionAttempts.push({ provider: 'mistral', status, detail: shortProviderError(mistralErr), ms: Date.now() - started });
-      markProviderResult('mistral', status);
+      const out = await callGroqVision(pageImages, prompt, { json: true });
+      // Only accept a usable quiz: it parses and keeps (nearly) every task the sheet labels.
+      const parsed = parseQuizResponse(out);
+      const filled = (parsed.tasks || []).filter(taskHasRealContent).length;
+      if (!filled || (labelledTasks >= 2 && (parsed.tasks || []).length < labelledTasks - 1)) {
+        throw new Error(`unusable reply (${(parsed.tasks || []).length} tasks, ${filled} with questions; the sheet labels ${labelledTasks})`);
+      }
+      raw = out;
+      retryFn = (retryPrompt) => callGroqVision(pageImages, retryPrompt + transcriptBlock(transcript, { canSeePages: true }), { json: true });
+      provider = 'groq-vision';
+      markProviderResult('groq-vision', 'OK');
+    } catch (groqErr) {
+      const status = /unusable reply|invalid JSON/i.test(String(groqErr.message)) ? 'TEMPORARY_FAILURE' : classifyProviderError('groq-vision', groqErr);
+      visionAttempts.push({ provider: 'groq-vision', status, detail: shortProviderError(groqErr), ms: Date.now() - started });
+      if (status !== 'TEMPORARY_FAILURE') markProviderResult('groq-vision', status);
     }
   };
 
   if (!genAI || isProviderCoolingDown('gemini')) {
     if (!genAI) visionAttempts.push({ provider: 'gemini', status: 'DISABLED', detail: 'GEMINI_API_KEY not configured', ms: 0 });
-    await tryMistral();
+    await tryGroqVision();
   } else {
-    // Short first try only when Mistral can take over; otherwise Gemini gets the whole budget.
-    const firstBudget = mistralUsable() ? Math.min(GEMINI_TIMEOUT_WITH_FALLBACK_MS, GEMINI_VISION_TIMEOUT_MS, remaining()) : remaining();
+    // Short first try only when Groq vision can take over; otherwise Gemini gets the whole budget.
+    const firstBudget = groqVisionUsable() ? Math.min(GEMINI_TIMEOUT_WITH_FALLBACK_MS, GEMINI_VISION_TIMEOUT_MS, remaining()) : remaining();
     await tryGemini(firstBudget);
-    await tryMistral();
-    // Mistral missing or failing too: Gemini's "high demand" spells are usually short — keep trying it.
+    await tryGroqVision();
+    // Groq vision missing or failing too: Gemini's "high demand" spells are usually short — keep trying it.
     await tryGemini(remaining());
   }
 
@@ -1664,7 +1614,7 @@ async function generateQuizFromDocument({ buffer, mime, grade, subject, school, 
     provider = 'groq-text';
   }
 
-  const visualUnderstandingAvailable = provider === 'gemini' || provider === 'mistral';
+  const visualUnderstandingAvailable = provider === 'gemini' || provider === 'groq-vision';
   const quiz = applyExplicitMetadata(normalizeQuestionFields(parseQuizResponse(raw)), sourceText);
   const result = applyExplicitMetadata(normalizeQuestionFields(await retryIncompleteTasks(quiz, retryFn)), sourceText);
   result.visualUnderstandingAvailable = visualUnderstandingAvailable;
@@ -1731,7 +1681,7 @@ const SCRIPT_LANGUAGE_NAMES = {
 };
 
 module.exports = {
-  generateQuizFromImage, generateQuizFromPdf, generateQuizFromDocument, callGeminiVision, callQwenVision, callQwenVisionRaw, callGroqTextVisionFallback, callQwenOcrText, callTesseractOcrText, detectScriptLang, callOcrText, looksLikeDecodableImage, buildQuizFromWorksheetText, callGroqWithText, rasterizePdfPagesToImage, buildQuizVisionPrompt, cleanLLMJson, findIncompleteTasks, retryIncompleteTasks, htmlToStructuredText, extractPdfEmbeddedImages, hostExtractedImages,
+  generateQuizFromImage, generateQuizFromPdf, generateQuizFromDocument, callGeminiVision, callGroqVisionRaw, callGroqTextVisionFallback, callGroqVisionOcrText, callTesseractOcrText, detectScriptLang, callOcrText, looksLikeDecodableImage, buildQuizFromWorksheetText, callGroqWithText, rasterizePdfPagesToImage, buildQuizVisionPrompt, cleanLLMJson, findIncompleteTasks, retryIncompleteTasks, htmlToStructuredText, extractPdfEmbeddedImages, hostExtractedImages,
   geminiImageParts, geminiPdfPart, geminiRetry, geminiGenerate, geminiModel, withTimeout, GEMINI_VISION_TIMEOUT_MS, GEMINI_MODELS,
   VISION_TOTAL_BUDGET_MS, SYNC_VISION_BUDGET_MS,
   markProviderResult, isProviderCoolingDown, resetProviderCooldowns, describeVisionFailure, shortProviderError, assertQuizHasContent, EmptyQuizError,

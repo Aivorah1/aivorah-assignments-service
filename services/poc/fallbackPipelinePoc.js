@@ -33,6 +33,8 @@
 // substituted here since the entire point of this POC is to test a
 // Gemini-INDEPENDENT path. If Qwen access is restored later, swapping the
 // vision call back is a small, isolated change — not attempted silently.
+// 2026-11-24: only Gemini and Groq are used now, so this calls Groq vision
+// (worksheet/providers.js callGroqVision) instead of Mistral.
 const fs = require('fs');
 const path = require('path');
 
@@ -82,8 +84,6 @@ Return ONLY this JSON shape (no markdown, no explanation):
 
 const QWEN_VISION_MODEL = 'Qwen/Qwen2.5-VL-72B-Instruct'; // kept for reference / future swap-back
 const HF_TOKEN = process.env.HF_TOKEN;
-const MISTRAL_VISION_MODEL = 'pixtral-12b-2409';
-const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY;
 
 // ── 1. Document normalization ─────────────────────────────────────────
 async function normalizeDocument(buffer, filename) {
@@ -228,40 +228,11 @@ For EACH visual element, return:
 Return ONLY a JSON object: { "visuals": [ ... ] }. No markdown, no explanation.`;
 
 async function detectVisualsOnPage(pageImage) {
-  if (!MISTRAL_API_KEY) throw new Error('MISTRAL_API_KEY not configured');
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 90000);
-  try {
-    const res = await fetch('https://api.mistral.ai/v1/chat/completions', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${MISTRAL_API_KEY}`, 'Content-Type': 'application/json' },
-      signal: controller.signal,
-      body: JSON.stringify({
-        model: MISTRAL_VISION_MODEL,
-        messages: [{
-          role: 'user',
-          content: [
-            { type: 'image_url', image_url: `data:${pageImage.mime};base64,${pageImage.buffer.toString('base64')}` },
-            { type: 'text', text: BBOX_PROMPT },
-          ],
-        }],
-        max_tokens: 4096,
-        temperature: 0,
-        response_format: { type: 'json_object' },
-      }),
-    });
-    if (!res.ok) {
-      const body = await res.text();
-      throw new Error(`Mistral API ${res.status}: ${body.slice(0, 200)}`);
-    }
-    const json = await res.json();
-    const raw = json.choices?.[0]?.message?.content || '';
-    let parsed;
-    try { parsed = JSON.parse(cleanLLMJson(raw)); } catch { parsed = { visuals: [], parseError: raw.slice(0, 300) }; }
-    return (parsed.visuals || []).map(v => ({ ...v, pageIndex: pageImage.pageIndex }));
-  } finally {
-    clearTimeout(timer);
-  }
+  const { callGroqVision } = require('../worksheet/providers');
+  const raw = await callGroqVision([pageImage], BBOX_PROMPT, { json: true, maxTokens: 4096 });
+  let parsed;
+  try { parsed = JSON.parse(cleanLLMJson(raw)); } catch { parsed = { visuals: [], parseError: raw.slice(0, 300) }; }
+  return (parsed.visuals || []).map(v => ({ ...v, pageIndex: pageImage.pageIndex }));
 }
 
 async function detectAllVisuals(pageImages) {

@@ -21,6 +21,19 @@ jest.mock('groq-sdk', () => jest.fn().mockImplementation(() => ({
 })));
 
 const request = require('supertest');
+// Groq is called three ways: vision (an image in the message), vision used to
+// transcribe a page ("Transcribe ALL text…"), and text. Each can be mocked apart.
+const groqCall = (args) => {
+  const content = args && args.messages && args.messages[0] && args.messages[0].content;
+  if (!Array.isArray(content)) return 'text';
+  return /Transcribe ALL text/.test((content.find(c => c.type === 'text') || {}).text || '') ? 'ocr' : 'vision';
+};
+const groqByKind = (kinds) => (args) => {
+  const v = kinds[groqCall(args)];
+  if (v instanceof Error) return Promise.reject(v);
+  if (v === undefined) return Promise.reject(new Error(`unexpected Groq ${groqCall(args)} call`));
+  return Promise.resolve({ choices: [{ finish_reason: 'stop', message: { content: typeof v === 'string' ? v : JSON.stringify(v) } }] });
+};
 // A generated quiz always has at least one question (an empty one is rejected as EMPTY_QUIZ).
 const ONE_TASK = [{ title: 'Task 1', questions: [{ id: 'a', type: 'numeric', question: '2 + 2 = ?', answer: 4 }] }];
 
@@ -128,10 +141,13 @@ describe('POST /quiz/generate-image — OCR + Groq-structuring fallback when Gem
   beforeEach(() => { mockGenerateContent.mockReset(); mockGroqCreate.mockReset(); });
   afterEach(() => { global.fetch = realFetch; });
 
-  test('a real daily-quota Gemini failure falls back to OCR (Tesseract, real - no Qwen/network needed) + Groq structuring, which succeeds', async () => {
+  test('Gemini and Groq vision both down: OCR (Tesseract, real) + Groq text structuring, which succeeds', async () => {
     mockGenerateContent.mockRejectedValue(new Error('429 Too Many Requests: daily quota exceeded'));
-    global.fetch = jest.fn().mockRejectedValue(new Error('should not be reached - Tesseract should succeed first'));
-    mockGroqCreate.mockResolvedValue({ choices: [{ message: { content: JSON.stringify({ title: 'Structured From OCR Text', tasks: ONE_TASK }) } }] });
+    global.fetch = jest.fn().mockRejectedValue(new Error('no other AI service may be called'));
+    mockGroqCreate.mockImplementation(groqByKind({
+      vision: new Error('429 rate limit'),
+      text: { title: 'Structured From OCR Text', tasks: ONE_TASK },
+    }));
 
     const res = await request(app)
       .post('/quiz/generate-image')
@@ -139,32 +155,50 @@ describe('POST /quiz/generate-image — OCR + Groq-structuring fallback when Gem
 
     expect(res.status).toBe(200);
     expect(res.body.quiz.title).toBe('Structured From OCR Text');
+    expect(res.body.quiz.provider).toBe('groq-text');
     expect(global.fetch).not.toHaveBeenCalled();
     expect(mockGroqCreate).toHaveBeenCalledWith(expect.objectContaining({ model: 'openai/gpt-oss-120b' }));
   }, 30000);
 
-  test('when Tesseract itself fails on a given image, falls back to Qwen for OCR, then Groq structuring', async () => {
+  test('Gemini busy: Groq vision reads the picture itself (vision counts as available)', async () => {
     mockGenerateContent.mockRejectedValue(new Error('429 Too Many Requests: daily quota exceeded'));
-    global.fetch = jest.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({ choices: [{ message: { content: 'Task 1: Solve.\na) 2 + 2 = ___' } }] }),
-    });
-    mockGroqCreate.mockResolvedValue({ choices: [{ message: { content: JSON.stringify({ title: 'Structured From Qwen Fallback', tasks: ONE_TASK }) } }] });
+    mockGroqCreate.mockImplementation(groqByKind({ vision: { title: 'Read By Groq Vision', tasks: ONE_TASK } }));
 
-    // A garbage (non-decodable) buffer makes Tesseract throw via the
-    // format guard, exercising the fallback-to-Qwen path.
+    const res = await request(app)
+      .post('/quiz/generate-image')
+      .attach('image', TINY_PNG, { filename: 'worksheet.png', contentType: 'image/png' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.quiz.title).toBe('Read By Groq Vision');
+    expect(res.body.quiz.provider).toBe('groq-vision');
+    expect(res.body.quiz.visualUnderstandingAvailable).toBe(true);
+    const visionCall = mockGroqCreate.mock.calls.map(c => c[0]).find(a => groqCall(a) === 'vision');
+    expect(visionCall.model).toBe('qwen/qwen3.8-27b');
+    expect(visionCall.messages[0].content.some(c => c.type === 'image_url' && /^data:image\//.test(c.image_url.url))).toBe(true);
+  }, 30000);
+
+  test('when Tesseract itself fails on a given image, Groq vision transcribes it, then Groq text structures it', async () => {
+    mockGenerateContent.mockRejectedValue(new Error('429 Too Many Requests: daily quota exceeded'));
+    global.fetch = jest.fn().mockRejectedValue(new Error('no other AI service may be called'));
+    mockGroqCreate.mockImplementation(groqByKind({
+      vision: new Error('503 overloaded'),
+      ocr: 'Task 1: Solve. a) 2 + 2 = ___',
+      text: { title: 'Structured From Groq Transcription', tasks: ONE_TASK },
+    }));
+
+    // A garbage (non-decodable) buffer makes Tesseract throw via the format guard.
     const res = await request(app)
       .post('/quiz/generate-image')
       .attach('image', Buffer.from('not a real image at all'), { filename: 'worksheet.png', contentType: 'image/png' });
 
     expect(res.status).toBe(200);
-    expect(res.body.quiz.title).toBe('Structured From Qwen Fallback');
-    expect(global.fetch).toHaveBeenCalledWith('https://router.huggingface.co/v1/chat/completions', expect.objectContaining({ method: 'POST' }));
+    expect(res.body.quiz.title).toBe('Structured From Groq Transcription');
+    expect(global.fetch).not.toHaveBeenCalled();
   }, 30000);
 
-  test('when BOTH Tesseract and Qwen fail, surfaces a clean error, not a hang or a crash', async () => {
+  test('when Tesseract and Groq vision both fail, surfaces a clean error, not a hang or a crash', async () => {
     mockGenerateContent.mockRejectedValue(new Error('429 Too Many Requests: daily quota exceeded'));
-    global.fetch = jest.fn().mockRejectedValue(new Error('HF router down'));
+    mockGroqCreate.mockImplementation(groqByKind({ vision: new Error('503 overloaded'), ocr: new Error('503 overloaded') }));
 
     const res = await request(app)
       .post('/quiz/generate-image')

@@ -137,13 +137,14 @@ Root causes
 3. **Empty quizzes reached the review screen**, and on the website a failed job showed nothing (`Alert.alert` is a no-op on react-native-web).
 
 Fix
-- Background jobs keep trying to *read* the worksheet with vision for `VISION_TOTAL_BUDGET_MS` (240 s): a short Gemini try only when Mistral can take over → Mistral → Gemini again with the rest of the budget. Retries stop at the deadline (≤ 30 s waits). Sync routes keep the old budget (proxy timeout).
-- Rate-limited / out-of-quota / bad-key providers are skipped for 10 min (`services/providerCooldown.js`, also fed by `GET /quiz/providers`).
+- **Only two AI accounts: Gemini and Groq** (owner's decision, 2026-11-24). Mistral and Hugging Face (Qwen) are removed everywhere — worksheet → quiz, worksheet details extraction, pdf-to-quiz, drawing grading, figure splitting, OCR fallback and the `/poc/fallback` test route. The second picture reader is **Groq vision** (`GROQ_VISION_MODEL`, default `qwen/qwen3.8-27b`, same `GROQ_API_KEY`); OCR is Tesseract (local) with Groq vision transcription as its backup.
+- Chain for a worksheet job: Gemini (short first try only when Groq vision can take over) → Groq vision on the page images → Gemini again with the rest of `VISION_TOTAL_BUDGET_MS` (240 s) → Groq text on the OCR transcript. Retries stop at the deadline (≤ 30 s waits). Sync routes keep the old budget.
+- A Groq vision reply is only used if it parses and keeps (nearly) every task the sheet labels; otherwise the chain moves on.
+- Rate-limited / out-of-quota / bad-key providers are skipped for 10 min (`services/providerCooldown.js`, also fed by `GET /quiz/providers`, which now checks only `gemini`, `groq-vision` and `groq`).
 - `GEMINI_EXTRA_MODELS` (default `gemini-flash-latest,gemini-flash-lite-latest`) are tried after the configured models.
-- When vision still fails, `quiz.visionUnavailableReason` / `conversionReport.visionNote` say which provider failed and how ("Gemini was overloaded or timed out; Mistral is rate-limited"), and the review screen offers Retry.
+- When vision still fails, `quiz.visionUnavailableReason` / `conversionReport.visionNote` say which provider failed and how, and the review screen offers Retry.
 - `estimateSourceSectionCount` counts the sheet's own task labels (Task/Activity/Exercise/Section/Part N, Enrichment…) and falls back to blank lines only when there are none. MHLE-31 → 5.
 - A quiz with no questions anywhere fails with `EMPTY_QUIZ` (HTTP 422 on the sync routes) and a specific reason instead of returning an empty quiz.
-- `GET /quiz/providers` shows each Gemini model's status code (the SDK prefix and URL were eating the 120-char detail) and how long the answering model took.
+- `GET /quiz/providers` shows each Gemini model's status code and how long the answering model took.
 
-Still needed outside the code: Mistral's key is rate-limited on every call — activate a plan at console.mistral.ai (or remove `MISTRAL_API_KEY`) so there is a real second vision provider; Gemini's free tier is often "high demand", so a paid Gemini key would make reading the pictures fast and reliable.
-
+On Render: `MISTRAL_API_KEY`, `MISTRAL_VISION_MODEL` and `HF_TOKEN` are no longer read and can be deleted. Gemini's free tier is often "high demand", so a paid Gemini key would make reading the pictures fast and reliable.

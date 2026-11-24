@@ -4,7 +4,6 @@
 // back empty. Grade / curriculum / chapter code are now read from the printed
 // header and the file name, and the extraction falls back to OCR + text model.
 process.env.GEMINI_API_KEY = process.env.GEMINI_API_KEY || 'mock-gemini-key';
-delete process.env.MISTRAL_API_KEY;
 
 const fs = require('fs');
 const path = require('path');
@@ -76,7 +75,7 @@ describe('extraction with every vision provider down', () => {
   const realFetch = global.fetch;
   beforeEach(() => {
     mockGroqCreate.mockReset();
-    global.fetch = jest.fn(() => Promise.reject(new Error('HF router down')));
+    global.fetch = jest.fn(() => Promise.reject(new Error('no other AI service may be called')));
   });
   afterAll(async () => {
     global.fetch = realFetch;
@@ -84,15 +83,20 @@ describe('extraction with every vision provider down', () => {
   });
 
   test('an image page is read with OCR and extracted by the text model', async () => {
-    mockGroqCreate.mockResolvedValueOnce({ choices: [{ message: { content: JSON.stringify({
+    const reply = { choices: [{ message: { content: JSON.stringify({
       title: 'Draw your farm', chapter: '', subject: 'English', grade: '', curriculum: '', questions: [{ text: 'Draw your farm' }],
-    }) } }] });
+    }) } }] };
+    // Groq vision is down too; Groq's text model reads the OCR text.
+    mockGroqCreate.mockImplementation(async (args) => {
+      if (Array.isArray(args.messages[0].content)) throw new Error('503 overloaded');
+      return reply;
+    });
     const { extractWorksheetContent } = require('../../routes/assignments');
     const result = await extractWorksheetContent(
       [{ base64: fixture('b04-draw-your-farm-worksheet.jpeg').toString('base64'), mime: 'image/jpeg' }],
       { fileName: 'PYP3_LHLE-19.jpeg' },
     );
-    const prompt = mockGroqCreate.mock.calls[0][0].messages[0].content;
+    const prompt = mockGroqCreate.mock.calls.map(c => c[0]).find(a => !Array.isArray(a.messages[0].content)).messages[0].content;
     expect(prompt).toMatch(/OCR of the page image/);
     expect(prompt).toMatch(/farm/i);
     expect(result.title).toBe('Draw your farm');

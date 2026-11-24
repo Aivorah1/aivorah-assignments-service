@@ -13,35 +13,38 @@ const groqReply = obj => ({ choices: [{ finish_reason: 'stop', message: { conten
 const realFetch = global.fetch;
 
 beforeEach(() => { mockGemini.mockReset(); mockGroq.mockReset(); });
-afterEach(() => { global.fetch = realFetch; delete process.env.MISTRAL_API_KEY; });
+afterEach(() => { global.fetch = realFetch; });
+const isVision = (args) => Array.isArray(args.messages[0].content);
 
 describe('GET /quiz/providers', () => {
-  test('reports a dead Gemini key and a working Mistral as "vision available", with the reason', async () => {
+  test('only Gemini and Groq are checked; a dead Gemini key with working Groq vision is "vision available", with the reason', async () => {
     process.env.GEMINI_API_KEY = 'test';
     process.env.GROQ_API_KEY = 'test';
-    process.env.MISTRAL_API_KEY = 'test';
     mockGemini.mockRejectedValue(new Error('429 Too Many Requests: GenerateRequestsPerDay quota exceeded'));
     mockGroq.mockResolvedValue(groqReply({ ok: true }));
-    global.fetch = jest.fn(async () => ({ ok: true, json: async () => ({}), text: async () => '' }));
+    global.fetch = jest.fn().mockRejectedValue(new Error('no other AI service may be called'));
 
     const res = await request(app).get('/quiz/providers?refresh=1');
     expect(res.status).toBe(200);
+    expect(res.body.providers.map(p => p.provider).sort()).toEqual(['gemini', 'groq', 'groq-vision']);
     const by = Object.fromEntries(res.body.providers.map(p => [p.provider, p]));
     expect(by.gemini.status).toBe('QUOTA_EXHAUSTED');
     expect(by.gemini.detail).toMatch(/PerDay/);
-    expect(by.mistral.status).toBe('OK');
+    expect(by['groq-vision'].status).toBe('OK');
     expect(by.groq.status).toBe('OK');
     expect(res.body.visionAvailable).toBe(true);
+    expect(res.body.summary).toMatch(/groq-vision/);
+    expect(global.fetch).not.toHaveBeenCalled();
   });
 
   test('no working vision provider is called out plainly', async () => {
     process.env.GEMINI_API_KEY = 'test';
     mockGemini.mockRejectedValue(new Error('403 API key not valid'));
-    mockGroq.mockResolvedValue(groqReply({ ok: true }));
+    mockGroq.mockImplementation(async (args) => { if (isVision(args)) throw new Error('503 overloaded'); return groqReply({ ok: true }); });
     const res = await request(app).get('/quiz/providers?refresh=1');
     expect(res.body.visionAvailable).toBe(false);
     expect(res.body.summary).toMatch(/No vision provider is working/);
-    expect(res.body.providers.find(p => p.provider === 'mistral').status).toBe('DISABLED');
+    expect(res.body.providers.find(p => p.provider === 'groq-vision').status).toBe('TEMPORARY_FAILURE');
   });
 });
 
@@ -82,25 +85,39 @@ describe('POST /quiz/grade-answer', () => {
   });
 });
 
-describe('Mistral vision request', () => {
-  test('sends the prompt plus each page as an image, JSON mode, and falls through a retired model', async () => {
-    process.env.MISTRAL_API_KEY = 'test';
-    const { callMistralVision } = require('../../services/worksheet/providers');
-    const calls = [];
-    global.fetch = jest.fn(async (url, opts) => {
-      const body = JSON.parse(opts.body);
-      calls.push(body);
-      if (calls.length === 1) return { ok: false, status: 404, text: async () => 'invalid model' };
-      return { ok: true, json: async () => ({ choices: [{ message: { content: '{"tasks":[]}' } }] }) };
+describe('Groq vision request', () => {
+  test('sends the prompt plus each page as an image, JSON mode, strips reasoning, and falls through a retired model', async () => {
+    process.env.GROQ_API_KEY = 'test';
+    let callGroqVision;
+    jest.isolateModules(() => {
+      process.env.GROQ_VISION_MODEL = 'old/retired-vision,qwen/qwen3.8-27b';
+      ({ callGroqVision } = require('../../services/worksheet/providers'));
+      delete process.env.GROQ_VISION_MODEL;
     });
+    mockGroq
+      .mockRejectedValueOnce(new Error('404 The model `old/retired-vision` has been decommissioned'))
+      .mockResolvedValueOnce({ choices: [{ message: { content: '<think>reading</think>{"tasks":[]}' } }] });
     const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0, 0, 0]);
-    const raw = await callMistralVision([{ buffer: jpeg, mime: 'image/jpeg' }, { buffer: jpeg, mime: 'image/jpeg' }], 'PROMPT');
+    const raw = await callGroqVision([{ buffer: jpeg, mime: 'image/jpeg' }, { buffer: jpeg, mime: 'image/jpeg' }], 'PROMPT', { json: true });
     expect(raw).toBe('{"tasks":[]}');
-    expect(calls).toHaveLength(2);
-    expect(calls[1].model).not.toBe(calls[0].model);
+    const calls = mockGroq.mock.calls.map(c => c[0]);
+    expect(calls.map(c => c.model)).toEqual(['old/retired-vision', 'qwen/qwen3.8-27b']);
     expect(calls[1].response_format).toEqual({ type: 'json_object' });
     const content = calls[1].messages[0].content;
     expect(content[0]).toEqual({ type: 'text', text: 'PROMPT' });
-    expect(content.filter(c => c.type === 'image_url')).toHaveLength(2);
+    expect(content.filter(c => c.type === 'image_url').map(c => c.image_url.url.slice(0, 23))).toEqual(['data:image/jpeg;base64,', 'data:image/jpeg;base64,']);
+  });
+
+  test('an auth error is not hidden by trying other models', async () => {
+    process.env.GROQ_API_KEY = 'test';
+    let callGroqVision;
+    jest.isolateModules(() => {
+      process.env.GROQ_VISION_MODEL = 'a/one,b/two';
+      ({ callGroqVision } = require('../../services/worksheet/providers'));
+      delete process.env.GROQ_VISION_MODEL;
+    });
+    mockGroq.mockRejectedValue(new Error('401 Invalid API Key'));
+    await expect(callGroqVision([{ buffer: Buffer.from([0xff, 0xd8, 0xff]), mime: 'image/jpeg' }], 'P')).rejects.toThrow(/401/);
+    expect(mockGroq).toHaveBeenCalledTimes(1);
   });
 });

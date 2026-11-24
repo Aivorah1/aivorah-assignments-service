@@ -100,6 +100,12 @@ describe('POST /quiz/generate — real failure handling', () => {
   });
 });
 
+// Text-path tests: Groq vision (an image in the message) is rate-limited, Groq text answers.
+const textOnlyGroq = (reply) => (args) => (Array.isArray(args.messages[0].content)
+  ? Promise.reject(new Error('429 rate limit'))
+  : Promise.resolve(reply));
+const groqTextCalls = () => mockGroqCreate.mock.calls.map(c => c[0]).filter(a => !Array.isArray(a.messages[0].content));
+
 describe('POST /quiz/generate — fallback chain when Gemini fails (PDF path)', () => {
   // Root cause found via live testing 2026-09-12: some real worksheets
   // (e.g. this Telugu IB PYP fixture) have their actual question content
@@ -133,7 +139,7 @@ describe('POST /quiz/generate — fallback chain when Gemini fails (PDF path)', 
     // rasterized page's actual heading text ("Worksheet").
     mockGenerateContent.mockRejectedValue(new Error('429 Too Many Requests: daily quota exceeded'));
     global.fetch = jest.fn().mockRejectedValue(new Error('should not be reached - Tesseract should succeed first'));
-    mockGroqCreate.mockResolvedValue({ choices: [{ message: { content: JSON.stringify({ title: 'Structured From OCR Text', tasks: ONE_TASK }) } }] });
+    mockGroqCreate.mockImplementation(textOnlyGroq({ choices: [{ message: { content: JSON.stringify({ title: 'Structured From OCR Text', tasks: ONE_TASK }) } }] }));
 
     const res = await request(app)
       .post('/quiz/generate')
@@ -143,7 +149,7 @@ describe('POST /quiz/generate — fallback chain when Gemini fails (PDF path)', 
     expect(res.body.quiz.title).toBe('Structured From OCR Text');
     expect(global.fetch).not.toHaveBeenCalled();
     expect(mockGroqCreate).toHaveBeenCalledWith(expect.objectContaining({ model: 'openai/gpt-oss-120b' }));
-    const groqPromptText = mockGroqCreate.mock.calls[0][0].messages[0].content;
+    const groqPromptText = groqTextCalls()[0].messages[0].content;
     expect(groqPromptText).toMatch(/Worksheet/); // the real Tesseract-OCR'd heading made it into Groq's prompt
   }, 30000);
 
@@ -155,7 +161,7 @@ describe('POST /quiz/generate — fallback chain when Gemini fails (PDF path)', 
   test('a real Gemini failure on a Telugu worksheet whose questions are screenshots: pages are OCR\'d and Groq gets the questions', async () => {
     mockGenerateContent.mockRejectedValue(new Error('429 Too Many Requests: daily quota exceeded'));
     global.fetch = jest.fn().mockRejectedValue(new Error('no network calls expected'));
-    mockGroqCreate.mockResolvedValue({ choices: [{ message: { content: JSON.stringify({ title: 'From OCR', tasks: ONE_TASK }) } }] });
+    mockGroqCreate.mockImplementation(textOnlyGroq({ choices: [{ message: { content: JSON.stringify({ title: 'From OCR', tasks: ONE_TASK }) } }] }));
 
     const res = await request(app)
       .post('/quiz/generate')
@@ -164,7 +170,7 @@ describe('POST /quiz/generate — fallback chain when Gemini fails (PDF path)', 
     expect(res.status).toBe(200);
     expect(res.body.quiz.title).toBe('From OCR');
     expect(res.body.quiz.provider).toBe('groq-text');
-    const prompt = mockGroqCreate.mock.calls[0][0].messages[0].content;
+    const prompt = groqTextCalls()[0].messages[0].content;
     expect(prompt).toContain('పాము పుట్ట');      // only present inside a screenshot
     expect(prompt).toContain('రాణి సరస్సులో');
     expect(global.fetch).not.toHaveBeenCalled();
