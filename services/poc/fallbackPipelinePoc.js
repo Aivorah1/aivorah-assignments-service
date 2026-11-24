@@ -83,7 +83,6 @@ Return ONLY this JSON shape (no markdown, no explanation):
 }
 
 const QWEN_VISION_MODEL = 'Qwen/Qwen2.5-VL-72B-Instruct'; // kept for reference / future swap-back
-const HF_TOKEN = process.env.HF_TOKEN;
 
 // ── 1. Document normalization ─────────────────────────────────────────
 async function normalizeDocument(buffer, filename) {
