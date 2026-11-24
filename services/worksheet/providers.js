@@ -133,14 +133,15 @@ async function checkProviders({ force = false } = {}) {
     probe('gemini', async () => {
       if (!process.env.GEMINI_API_KEY) throw new Error('GEMINI_API_KEY not configured');
       const { GoogleGenerativeAI } = require('@google/generative-ai');
-      const models = (process.env.GEMINI_MODEL || 'gemini-2.5-flash').split(',').map(m => m.trim()).filter(Boolean);
+      const { GEMINI_MODELS, shortProviderError } = require('../quizVision');
       const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
       const errors = [];
-      for (const model of models) {
+      for (const model of GEMINI_MODELS) {
+        const started = Date.now();
         try {
           await genAI.getGenerativeModel({ model }).generateContent('Reply with OK');
-          return `model ${model} answered`;
-        } catch (err) { errors.push(`${model}: ${String(err.message).slice(0, 120)}`); }
+          return `model ${model} answered in ${Date.now() - started}ms${errors.length ? ` (before it: ${errors.join(' | ')})` : ''}`;
+        } catch (err) { errors.push(`${model}: ${shortProviderError(err)}`); }
       }
       throw new Error(errors.join(' | '));
     }),
@@ -164,6 +165,9 @@ async function checkProviders({ force = false } = {}) {
       return 'text model answered';
     }),
   ]);
+  // The pipeline skips a provider that is rate-limited / out of quota for a while.
+  const { markProviderResult } = require('../quizVision');
+  for (const r of results) if (r.provider === 'mistral' || r.status !== 'TEMPORARY_FAILURE') markProviderResult(r.provider, r.status);
   const vision = results.filter(r => ['gemini', 'mistral'].includes(r.provider) && r.status === 'OK').map(r => r.provider);
   const result = {
     checkedAt: new Date().toISOString(),

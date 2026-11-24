@@ -126,3 +126,24 @@ provider keys/network) — verify with real keys after deploy.
 - **Missing pictures in the preview.** Pictures are referenced by id (`img://p1-3`) and resolved after generation to the hosted URL, or inline (data URI) when Cloudinary isn't configured; a task left without a picture gets the pictures printed in its own region (`attachRegionPictures`).
 - **Upload form stuck on the teacher's Grade 6 / CBSE, chapter "loading".** The form's only source was the AI extraction job, which returns nothing when Gemini and Qwen are both down; the frontend also never applied the extracted curriculum. New `POST /assignments/detect-meta` reads grade / curriculum / chapter code from the PDF/docx header text and the file name in about a second (`utils/worksheetMeta.js`); extraction now falls back Gemini → Mistral → Qwen → OCR + Groq text, and fills blanks from the same detector.
 - **Test speed.** PNG encoding goes through pngjs with a fixed filter (`pngBuffer`) — Jimp's encoder and pngjs's adaptive filter search were ~10× slower under jest.
+
+### 2026-11-24 — MHLE-31 "no vision AI", missing answers, "~19 sections"
+
+Live repro (`/quiz/generate-async`, `b07-area-perimeter-matching-worksheet.pdf` = MHLE-31): **provider `groq-text`, vision false, 186 s**; Tasks 1–2 REQUIRES_REVIEW, picture answers empty. `GET /quiz/providers` at the same time: Gemini **OK but slow** (72 s for "Reply with OK", then failing in ~200 ms on the next probe — free-tier "high demand"), Mistral **429 rate-limited** every time, Groq OK.
+
+Root causes
+1. **Gemini was cut off too early.** With `MISTRAL_API_KEY` set, Gemini got only `min(GEMINI_TIMEOUT_WITH_FALLBACK_MS, GEMINI_VISION_TIMEOUT_MS)` (90 s on Render) because Mistral was assumed to take over — but Mistral answers 429 on every call, so every worksheet dropped to OCR text + Groq.
+2. **"Roughly 19 sections"** came from counting blank-line blocks in the document-model transcript (it has a blank line around every picture/row). MHLE-31 has 5 tasks.
+3. **Empty quizzes reached the review screen**, and on the website a failed job showed nothing (`Alert.alert` is a no-op on react-native-web).
+
+Fix
+- Background jobs keep trying to *read* the worksheet with vision for `VISION_TOTAL_BUDGET_MS` (240 s): a short Gemini try only when Mistral can take over → Mistral → Gemini again with the rest of the budget. Retries stop at the deadline (≤ 30 s waits). Sync routes keep the old budget (proxy timeout).
+- Rate-limited / out-of-quota / bad-key providers are skipped for 10 min (`services/providerCooldown.js`, also fed by `GET /quiz/providers`).
+- `GEMINI_EXTRA_MODELS` (default `gemini-flash-latest,gemini-flash-lite-latest`) are tried after the configured models.
+- When vision still fails, `quiz.visionUnavailableReason` / `conversionReport.visionNote` say which provider failed and how ("Gemini was overloaded or timed out; Mistral is rate-limited"), and the review screen offers Retry.
+- `estimateSourceSectionCount` counts the sheet's own task labels (Task/Activity/Exercise/Section/Part N, Enrichment…) and falls back to blank lines only when there are none. MHLE-31 → 5.
+- A quiz with no questions anywhere fails with `EMPTY_QUIZ` (HTTP 422 on the sync routes) and a specific reason instead of returning an empty quiz.
+- `GET /quiz/providers` shows each Gemini model's status code (the SDK prefix and URL were eating the 120-char detail) and how long the answering model took.
+
+Still needed outside the code: Mistral's key is rate-limited on every call — activate a plan at console.mistral.ai (or remove `MISTRAL_API_KEY`) so there is a real second vision provider; Gemini's free tier is often "high demand", so a paid Gemini key would make reading the pictures fast and reliable.
+

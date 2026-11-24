@@ -1,5 +1,6 @@
 process.env.GEMINI_API_KEY = 'mock-gemini-key';
 process.env.GEMINI_MODEL = 'model-a, model-b,model-c';
+process.env.GEMINI_EXTRA_MODELS = '';
 
 const mockGetGenerativeModel = jest.fn();
 jest.mock('@google/generative-ai', () => ({
@@ -54,4 +55,16 @@ test('the generation config is passed to every model tried', async () => {
   modelsBehaving({ 'model-a': new Error('503'), 'model-b': 'B' });
   await geminiModel({ temperature: 0 }).generateContent(['x']);
   mockGetGenerativeModel.mock.calls.forEach(([o]) => expect(o.generationConfig).toEqual({ temperature: 0 }));
+});
+
+test('by default the rolling flash aliases are tried after the configured models', () => {
+  jest.isolateModules(() => {
+    const saved = process.env.GEMINI_EXTRA_MODELS;
+    delete process.env.GEMINI_EXTRA_MODELS;
+    process.env.GEMINI_MODEL = 'gemini-3.6-flash,gemini-flash-latest';
+    const { GEMINI_MODELS } = require('../../services/quizVision');
+    expect(GEMINI_MODELS).toEqual(['gemini-3.6-flash', 'gemini-flash-latest', 'gemini-flash-lite-latest']);
+    process.env.GEMINI_EXTRA_MODELS = saved;
+    process.env.GEMINI_MODEL = 'model-a, model-b,model-c';
+  });
 });

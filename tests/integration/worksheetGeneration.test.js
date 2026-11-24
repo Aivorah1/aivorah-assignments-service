@@ -19,9 +19,10 @@ jest.mock('cloudinary', () => ({
 }));
 
 process.env.GEMINI_API_KEY = 'test';
+process.env.GEMINI_TIMEOUT_WITH_FALLBACK_MS = '11000'; // Gemini's quick first try when Mistral could take over
 const fs = require('fs');
 const path = require('path');
-const { generateQuizFromDocument } = require('../../services/quizVision');
+const { generateQuizFromDocument, resetProviderCooldowns } = require('../../services/quizVision');
 const documentModel = require('../../services/worksheet/documentModel');
 
 // The real document model, built once per fixture (it's slow under jest);
@@ -46,6 +47,7 @@ beforeEach(() => {
   uploads = 0;
   mockUpload.mockReset().mockImplementation(async () => ({ secure_url: `https://img.test/${++uploads}.png` }));
   delete process.env.MISTRAL_API_KEY;
+  resetProviderCooldowns();
 });
 afterEach(() => { global.fetch = realFetch; });
 
@@ -123,4 +125,92 @@ test('pictures reach their tasks: model ids resolved, region pictures attached, 
   expect(t2.regionCrop).toBeUndefined();
   expect(t3.regionCrop).toBe(true);                                       // no picture in its region → page crop
   expect(t3.questions[0].imageUrl).toMatch(/^https:\/\/img\.test\//);
+}, 180000);
+
+// MHLE-31 (2026-11-24 report): Gemini was healthy but "high demand" for a
+// moment; the job gave it 90s, Mistral was rate-limited, so the quiz came out
+// text-only — picture tasks without answers, "roughly 19 sections" warning.
+const MHLE31_QUIZ = {
+  title: 'MHLE - 31', tasks: [
+    { title: 'Task 1: Find the area and perimeter of the given shapes in each grid.', tier: 'MUST DO', questions: [
+      { id: 'a', type: 'text', question: 'Shape 1: Perimeter = ___ units, Area = ___ sq units', answer: 'Perimeter = 16 units, Area = 12 sq units', imageUrl: 'img://p1-2' },
+    ] },
+    { title: 'Task 2: Measure the given angles using protractor and name the type of angle (acute/right/obtuse angled).', tier: 'MUST DO', questions: [
+      { id: 'a', type: 'mcq', question: 'Angle a) measures 45°. What type of angle is it?', options: ['acute', 'right', 'obtuse'], answer: 'acute', imageUrl: 'img://p1-1' },
+    ] },
+    { title: 'Task 3: Match the length and width to the area and perimeter of each shape.', tier: 'COULD DO', questions: [
+      { id: 'a', type: 'text', question: 'Length 3, width 2: Area = ?', answer: '6' },
+    ] },
+    { title: 'Task 4: Find the area and perimeter of the given squares with the following dimensions.', tier: 'COULD DO', questions: [
+      { id: 'a', type: 'numeric', question: 'Side = 6 cm. Perimeter = ?', answer: 24, unit: 'cm' },
+    ] },
+    { title: 'Enrichment Task: Relationship of area and perimeter.', tier: 'ENRICHMENT', questions: [
+      { id: 'a', type: 'text', question: 'Draw a square with the same area and perimeter. Label the sides.', answer: 'A square of side 4 units' },
+    ] },
+  ],
+};
+const geminiReply = obj => ({ response: { text: () => JSON.stringify(obj) } });
+const mistral429 = () => {
+  process.env.MISTRAL_API_KEY = 'test';
+  const calls = [];
+  global.fetch = jest.fn(async (url, opts) => {
+    if (String(url).includes('api.mistral.ai')) {
+      calls.push(url);
+      return { ok: false, status: 429, text: async () => '{"message":"Rate limit exceeded","code":"1300"}' };
+    }
+    return realFetch(url, opts);
+  });
+  return calls;
+};
+
+test('a busy Gemini is tried again after Mistral is rate-limited, instead of settling for text only', async () => {
+  const mistralCalls = mistral429();
+  mockGemini.mockReset()
+    .mockRejectedValueOnce(new Error('[GoogleGenerativeAI Error]: Error fetching from https://x: [503 Service Unavailable] This model is currently experiencing high demand.'))
+    .mockResolvedValue(geminiReply(MHLE31_QUIZ));
+  const quiz = await generateQuizFromDocument({ buffer: fixture('b07-area-perimeter-matching-worksheet.pdf'), mime: 'application/pdf', visionBudgetMs: 60000 });
+
+  expect(quiz.provider).toBe('gemini');
+  expect(quiz.visualUnderstandingAvailable).toBe(true);
+  expect(quiz.tasks).toHaveLength(5);
+  expect(quiz.tasks[1].questions[0].answer).toBe('acute');
+  expect(quiz.tasks[0].questions[0].imageUrl).toMatch(/^https:\/\/img\.test\//); // the grid picture, hosted
+  expect(quiz.tasks[1].questions[0].imageUrl).toMatch(/^https:\/\/img\.test\//); // the angles picture
+  expect(quiz.conversionReport.sourceSectionEstimate).toBe(5);               // was "roughly 19"
+  expect(quiz.conversionReport.taskCountWarning).toBeUndefined();
+  expect(quiz.conversionReport.visionNote).toBeUndefined();
+  expect(mistralCalls.length).toBeGreaterThanOrEqual(0);
+}, 180000);
+
+test('a rate-limited Mistral is skipped on the next worksheet (cooldown), not called again', async () => {
+  const mistralCalls = mistral429();
+  // Gemini's quick first try hangs past its window, Mistral is asked and answers 429, Gemini is tried again.
+  mockGemini.mockReset().mockImplementationOnce(() => new Promise(() => {})).mockResolvedValue(geminiReply(MHLE31_QUIZ));
+  const first = await generateQuizFromDocument({ buffer: fixture('b07-area-perimeter-matching-worksheet.pdf'), mime: 'application/pdf', visionBudgetMs: 60000 });
+  expect(first.provider).toBe('gemini');
+  expect(first.visionAttempts.map(a => `${a.provider}:${a.status}`)).toEqual(['gemini:TEMPORARY_FAILURE', 'mistral:RATE_LIMITED']);
+  const after = mistralCalls.length;
+  expect(after).toBeGreaterThan(0);
+  mockGemini.mockReset().mockResolvedValue(geminiReply(MHLE31_QUIZ));
+  const quiz = await generateQuizFromDocument({ buffer: fixture('b07-area-perimeter-matching-worksheet.pdf'), mime: 'application/pdf', visionBudgetMs: 60000 });
+  expect(quiz.provider).toBe('gemini');
+  expect(mistralCalls.length).toBe(after);
+}, 180000);
+
+test('when no vision AI answers, the quiz says exactly why and offers a retry', async () => {
+  mistral429();
+  mockGemini.mockReset().mockRejectedValue(new Error('[503 Service Unavailable] high demand'));
+  mockGroq.mockResolvedValue(groqReply(MHLE31_QUIZ));
+  const quiz = await generateQuizFromDocument({ buffer: fixture('b07-area-perimeter-matching-worksheet.pdf'), mime: 'application/pdf', visionBudgetMs: 12000 });
+
+  expect(quiz.provider).toBe('groq-text');
+  expect(quiz.visionUnavailableReason).toMatch(/Gemini was overloaded or timed out; Mistral is rate-limited/);
+  expect(quiz.visionUnavailableReason).toMatch(/Retry/);
+  expect(quiz.conversionReport.visionNote).toBe(quiz.visionUnavailableReason);
+}, 180000);
+
+test('a worksheet that yields no questions fails with a specific reason instead of an empty quiz', async () => {
+  mockGroq.mockResolvedValue(groqReply({ title: 'MHLE - 31', tasks: [{ title: 'Task 1: Find the area', questions: [] }] }));
+  await expect(generateQuizFromDocument({ buffer: fixture('b07-area-perimeter-matching-worksheet.pdf'), mime: 'application/pdf', visionBudgetMs: 12000 }))
+    .rejects.toMatchObject({ code: 'EMPTY_QUIZ', message: expect.stringMatching(/No questions could be read from this worksheet \(1 task heading/) });
 }, 180000);

@@ -21,6 +21,8 @@ jest.mock('groq-sdk', () => jest.fn().mockImplementation(() => ({
 })));
 
 const request = require('supertest');
+// A generated quiz always has at least one question (an empty one is rejected as EMPTY_QUIZ).
+const ONE_TASK = [{ title: 'Task 1', questions: [{ id: 'a', type: 'numeric', question: '2 + 2 = ?', answer: 4 }] }];
 
 function geminiJsonResponse(obj) {
   return Promise.resolve({ response: { text: () => JSON.stringify(obj) } });
@@ -70,7 +72,7 @@ describe('POST /quiz/generate-image — real generation contract', () => {
   });
 
   test('a real prompt was sent with the requested grade/subject and vision image data', async () => {
-    mockGenerateContent.mockResolvedValue(geminiJsonResponse({ title: 'x', tasks: [] }));
+    mockGenerateContent.mockResolvedValue(geminiJsonResponse({ title: 'x', tasks: ONE_TASK }));
 
     await request(app)
       .post('/quiz/generate-image')
@@ -129,7 +131,7 @@ describe('POST /quiz/generate-image — OCR + Groq-structuring fallback when Gem
   test('a real daily-quota Gemini failure falls back to OCR (Tesseract, real - no Qwen/network needed) + Groq structuring, which succeeds', async () => {
     mockGenerateContent.mockRejectedValue(new Error('429 Too Many Requests: daily quota exceeded'));
     global.fetch = jest.fn().mockRejectedValue(new Error('should not be reached - Tesseract should succeed first'));
-    mockGroqCreate.mockResolvedValue({ choices: [{ message: { content: JSON.stringify({ title: 'Structured From OCR Text', tasks: [] }) } }] });
+    mockGroqCreate.mockResolvedValue({ choices: [{ message: { content: JSON.stringify({ title: 'Structured From OCR Text', tasks: ONE_TASK }) } }] });
 
     const res = await request(app)
       .post('/quiz/generate-image')
@@ -147,7 +149,7 @@ describe('POST /quiz/generate-image — OCR + Groq-structuring fallback when Gem
       ok: true,
       json: async () => ({ choices: [{ message: { content: 'Task 1: Solve.\na) 2 + 2 = ___' } }] }),
     });
-    mockGroqCreate.mockResolvedValue({ choices: [{ message: { content: JSON.stringify({ title: 'Structured From Qwen Fallback', tasks: [] }) } }] });
+    mockGroqCreate.mockResolvedValue({ choices: [{ message: { content: JSON.stringify({ title: 'Structured From Qwen Fallback', tasks: ONE_TASK }) } }] });
 
     // A garbage (non-decodable) buffer makes Tesseract throw via the
     // format guard, exercising the fallback-to-Qwen path.

@@ -21,6 +21,8 @@ jest.mock('groq-sdk', () => jest.fn().mockImplementation(() => ({
 const request = require('supertest');
 const fs = require('fs');
 const path = require('path');
+// A generated quiz always has at least one question (an empty one is rejected as EMPTY_QUIZ).
+const ONE_TASK = [{ title: 'Task 1', questions: [{ id: 'a', type: 'numeric', question: '2 + 2 = ?', answer: 4 }] }];
 
 function geminiJsonResponse(obj) {
   return Promise.resolve({ response: { text: () => JSON.stringify(obj) } });
@@ -61,7 +63,7 @@ describe('POST /quiz/generate — real generation contract', () => {
   });
 
   test('the PDF is sent as inline PDF data, not re-rasterized into images', async () => {
-    mockGenerateContent.mockResolvedValue(geminiJsonResponse({ title: 'x', tasks: [] }));
+    mockGenerateContent.mockResolvedValue(geminiJsonResponse({ title: 'x', tasks: ONE_TASK }));
     const pdfBytes = Buffer.from('%PDF-fake');
 
     await request(app).post('/quiz/generate').attach('pdf', pdfBytes, { filename: 'worksheet.pdf', contentType: 'application/pdf' });
@@ -131,7 +133,7 @@ describe('POST /quiz/generate — fallback chain when Gemini fails (PDF path)', 
     // rasterized page's actual heading text ("Worksheet").
     mockGenerateContent.mockRejectedValue(new Error('429 Too Many Requests: daily quota exceeded'));
     global.fetch = jest.fn().mockRejectedValue(new Error('should not be reached - Tesseract should succeed first'));
-    mockGroqCreate.mockResolvedValue({ choices: [{ message: { content: JSON.stringify({ title: 'Structured From OCR Text', tasks: [] }) } }] });
+    mockGroqCreate.mockResolvedValue({ choices: [{ message: { content: JSON.stringify({ title: 'Structured From OCR Text', tasks: ONE_TASK }) } }] });
 
     const res = await request(app)
       .post('/quiz/generate')
@@ -153,7 +155,7 @@ describe('POST /quiz/generate — fallback chain when Gemini fails (PDF path)', 
   test('a real Gemini failure on a Telugu worksheet whose questions are screenshots: pages are OCR\'d and Groq gets the questions', async () => {
     mockGenerateContent.mockRejectedValue(new Error('429 Too Many Requests: daily quota exceeded'));
     global.fetch = jest.fn().mockRejectedValue(new Error('no network calls expected'));
-    mockGroqCreate.mockResolvedValue({ choices: [{ message: { content: JSON.stringify({ title: 'From OCR', tasks: [] }) } }] });
+    mockGroqCreate.mockResolvedValue({ choices: [{ message: { content: JSON.stringify({ title: 'From OCR', tasks: ONE_TASK }) } }] });
 
     const res = await request(app)
       .post('/quiz/generate')
@@ -261,7 +263,7 @@ describe('quiz_generate job handler — same logic as the synchronous route', ()
   beforeEach(() => mockGenerateContent.mockReset());
 
   test('a real payload (base64 PDF) is decoded and produces the real { quiz } result shape', async () => {
-    mockGenerateContent.mockResolvedValue(geminiJsonResponse({ title: 'Queued Worksheet', tasks: [] }));
+    mockGenerateContent.mockResolvedValue(geminiJsonResponse({ title: 'Queued Worksheet', tasks: ONE_TASK }));
     // Exercises the exact same decode + call-through jobHandlers.js's
     // registered 'quiz_generate' handler performs.
     const { generateQuizFromPdf } = require('../../services/quizVision');

@@ -10,7 +10,13 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 // Comma-separated, tried in order: newer Google projects can't use gemini-2.5-flash,
 // and single models are often "high demand" (503) on the free tier.
-const GEMINI_MODELS = (process.env.GEMINI_MODEL || 'gemini-2.5-flash').split(',').map(m => m.trim()).filter(Boolean);
+// GEMINI_EXTRA_MODELS (default: Google's rolling "latest" aliases) are tried
+// after the configured ones: on the free tier the main flash model is often
+// "high demand" (503) for minutes while the lite/alias models still answer.
+const GEMINI_MODELS = [...new Set([
+  ...(process.env.GEMINI_MODEL || 'gemini-2.5-flash').split(','),
+  ...(process.env.GEMINI_EXTRA_MODELS ?? 'gemini-flash-latest,gemini-flash-lite-latest').split(','),
+].map(m => m.trim()).filter(Boolean))];
 
 // Same shape as a Gemini model; an overloaded or retired model moves on to the next instead of waiting.
 function geminiModel(generationConfig) {
@@ -309,7 +315,9 @@ function withTimeout(promise, ms, label) {
 }
 
 // Retry wrapper: exponential backoff on Gemini 429 (rate limit) / 503 (overloaded).
-async function geminiRetry(fn, { tries = 6, base = 2500 } = {}) {
+// With a deadline, stops before a wait that would run past it (the caller's
+// timeout would cut the attempt anyway) and caps each wait at 30s.
+async function geminiRetry(fn, { tries = 6, base = 2500, deadline } = {}) {
   let lastErr;
   for (let i = 0; i < tries; i++) {
     try {
@@ -328,16 +336,20 @@ async function geminiRetry(fn, { tries = 6, base = 2500 } = {}) {
       if (is429 && /PerDay|per.?day|daily|prepayment|credits?\s+(are\s+)?depleted|billing|insufficient.?(funds|balance)/i.test(msg)) throw e;
       if ((!is429 && !is503) || i === tries - 1) throw e;
       const suggested = msg.match(/retry.?after[^\d]*(\d+)/i) || msg.match(/retryDelay["\s:]+(\d+)/i);
-      const wait = suggested ? parseInt(suggested[1], 10) * 1000
+      let wait = suggested ? parseInt(suggested[1], 10) * 1000
         : base * Math.pow(2, i) + Math.floor(Math.random() * 600);
+      if (deadline) {
+        wait = Math.min(wait, 30000);
+        if (Date.now() + wait + 5000 > deadline) throw e;
+      }
       await new Promise(r => setTimeout(r, wait));
     }
   }
   throw lastErr;
 }
 
-async function geminiGenerate(model, content) {
-  const result = await geminiRetry(() => model.generateContent(content));
+async function geminiGenerate(model, content, retryOpts) {
+  const result = await geminiRetry(() => model.generateContent(content), retryOpts);
   return result.response.text();
 }
 
@@ -1000,9 +1012,31 @@ function buildConversionReport(quiz, { sourceSectionEstimate, sourceText } = {})
 // as a hard failure would trade one class of false confidence (silent
 // loss) for another (false alarms on correct conversions). Surfaced in
 // the report for human/teacher judgment, not enforced automatically.
+// 2026-11-24: on a real MHLE-31 sheet (5 tasks) the blank-line count said
+// "roughly 19 sections" — the document-model transcript has a blank line
+// between every picture/row — and the teacher was told tasks were missing.
+// When the sheet labels its own tasks ("Task 1", "Activity 2", "Exercise
+// B", "Enrichment Task") those headings are counted instead; the blank-line
+// count is only the fallback for sheets with no such labels.
+const TASK_HEADING_RE = /^(?:\*\*)?\s*(task|activity|exercise|section|part|worksheet\s+task)\s*[-–:.#]?\s*(\d{1,2}|[ivx]{1,4}|[a-h])\b/i;
+const ENRICHMENT_HEADING_RE = /^(?:\*\*)?\s*(enrichment|challenge|extension|bonus)(\s+(task|activity|question))?\b\s*[:\-–]/i;
+function countLabelledTaskHeadings(text) {
+  const seen = new Set();
+  for (const line of text.split('\n')) {
+    for (const cell of line.split(/\s{2,}\|\s{2,}|\s\|\s/)) {
+      const c = cell.trim();
+      const m = c.match(TASK_HEADING_RE);
+      if (m) seen.add(`${m[1].toLowerCase()} ${m[2].toLowerCase()}`);
+      else if (ENRICHMENT_HEADING_RE.test(c)) seen.add(`enrichment ${c.slice(0, 12).toLowerCase()}`);
+    }
+  }
+  return seen.size;
+}
 function estimateSourceSectionCount(sourceText) {
   const text = String(sourceText || '').trim();
   if (!text) return 0;
+  const labelled = countLabelledTaskHeadings(text);
+  if (labelled > 0) return labelled;
   const blocks = text.split(/\n\s*\n/).map(b => b.trim()).filter(Boolean);
   const headingLikeBlocks = blocks.filter(b => {
     const firstLine = b.split('\n')[0].trim();
@@ -1178,8 +1212,8 @@ async function retryIncompleteTasks(quiz, retryFn) {
 
 // Single image → quiz JSON. Same provider-agnostic flow as PDFs: see
 // generateQuizFromDocument.
-async function generateQuizFromImage(imageBuffer, mime, { grade, subject, school, language } = {}) {
-  return generateQuizFromDocument({ buffer: imageBuffer, mime: mime || 'image/png', grade, subject, school, language });
+async function generateQuizFromImage(imageBuffer, mime, { grade, subject, school, language, visionBudgetMs } = {}) {
+  return generateQuizFromDocument({ buffer: imageBuffer, mime: mime || 'image/png', grade, subject, school, language, visionBudgetMs });
 }
 
 // Structures already-extracted worksheet TEXT into quiz JSON via Groq's
@@ -1482,8 +1516,8 @@ async function rasterizePdfPagesToImage(pdfBuffer, { maxPages = 4 } = {}) {
 // PDF (or a docx already converted to PDF upstream, with its exact
 // structuredText) → quiz JSON. Powers /quiz/generate and the queued
 // /quiz/generate-async job.
-async function generateQuizFromPdf(pdfBuffer, { grade, subject, school, structuredText, language } = {}) {
-  return generateQuizFromDocument({ buffer: pdfBuffer, mime: 'application/pdf', grade, subject, school, structuredText, language });
+async function generateQuizFromPdf(pdfBuffer, { grade, subject, school, structuredText, language, visionBudgetMs } = {}) {
+  return generateQuizFromDocument({ buffer: pdfBuffer, mime: 'application/pdf', grade, subject, school, structuredText, language, visionBudgetMs });
 }
 
 // ── Provider-agnostic worksheet → quiz ────────────────────────────────────
@@ -1498,9 +1532,41 @@ async function generateQuizFromPdf(pdfBuffer, { grade, subject, school, structur
 // skipped OCR when it had ≥300 chars, OCR'd a stitched ~108dpi strip, and
 // listed pictures without positions — ~20% of real worksheets converted.
 const DOCUMENT_MODEL_TIMEOUT_MS = parseInt(process.env.DOCUMENT_MODEL_TIMEOUT_MS || '150000', 10);
-// With a second vision provider configured, a rate-limited Gemini isn't worth
-// waiting out (its retries back off for up to GEMINI_VISION_TIMEOUT_MS).
+// With a second vision provider that is actually answering, a slow Gemini
+// isn't worth waiting out (its retries back off for up to GEMINI_VISION_TIMEOUT_MS).
 const GEMINI_TIMEOUT_WITH_FALLBACK_MS = parseInt(process.env.GEMINI_TIMEOUT_WITH_FALLBACK_MS || '30000', 10);
+// Total time the worksheet job keeps trying to READ the pages with a vision
+// model before settling for a text-only quiz. Generation runs as a background
+// job, so waiting a few minutes for Gemini's "high demand" spell to pass is far
+// better than a quiz whose picture questions have no answers (2026-11-24: the
+// live service gave Gemini 90s, Mistral was rate-limited, so every worksheet
+// went text-only even though Gemini answered moments later).
+const VISION_TOTAL_BUDGET_MS = parseInt(process.env.VISION_TOTAL_BUDGET_MS || '240000', 10);
+// Synchronous requests (/quiz/generate, /quiz/generate-image) sit behind a
+// ~100s proxy timeout, so they keep the old single Gemini budget.
+const SYNC_VISION_BUDGET_MS = GEMINI_VISION_TIMEOUT_MS;
+
+const { markProviderResult, isProviderCoolingDown, resetProviderCooldowns } = require('./providerCooldown');
+
+// "[GoogleGenerativeAI Error]: Error fetching from https://…: [503 Service Unavailable] …" → "503 Service Unavailable …"
+function shortProviderError(err) {
+  const msg = String((err && err.message) || err || '');
+  return msg.replace(/\[GoogleGenerativeAI Error\]:\s*/g, '').replace(/Error fetching from \S+?:\s*/g, '').replace(/[[\]]/g, '').slice(0, 160);
+}
+
+const PROVIDER_LABELS = { gemini: 'Gemini', mistral: 'Mistral' };
+const STATUS_WORDS = {
+  RATE_LIMITED: 'is rate-limited', QUOTA_EXHAUSTED: 'is out of quota', AUTH_FAILURE: 'rejected the API key',
+  DISABLED: 'is not configured', TEMPORARY_FAILURE: 'was overloaded or timed out',
+};
+// One sentence a teacher can act on: why the pages couldn't be read with vision.
+function describeVisionFailure(attempts) {
+  const seen = new Map();
+  for (const a of attempts) seen.set(a.provider, a);
+  const parts = [...seen.values()].map(a => `${PROVIDER_LABELS[a.provider] || a.provider} ${STATUS_WORDS[a.status] || 'failed'}`);
+  if (!parts.length) return '';
+  return `The picture-reading AI could not be reached (${parts.join('; ')}), so this quiz was built from the worksheet's text only. Press Retry in a few minutes to read the pictures too.`;
+}
 
 async function buildWorksheetDocument({ buffer, mime, structuredText, hints }) {
   const { buildDocumentModel } = require('./worksheet/documentModel');
@@ -1513,7 +1579,7 @@ async function buildWorksheetDocument({ buffer, mime, structuredText, hints }) {
   }
 }
 
-async function generateQuizFromDocument({ buffer, mime, grade, subject, school, structuredText, language } = {}) {
+async function generateQuizFromDocument({ buffer, mime, grade, subject, school, structuredText, language, visionBudgetMs = VISION_TOTAL_BUDGET_MS } = {}) {
   const { callMistralVision, transcriptBlock } = require('./worksheet/providers');
   const isPdf = /pdf/i.test(mime || '');
   const doc = await buildWorksheetDocument({ buffer, mime, structuredText, hints: [language, subject] });
@@ -1522,35 +1588,63 @@ async function generateQuizFromDocument({ buffer, mime, grade, subject, school, 
 
   let raw, retryFn, provider;
   let sourceText = transcript;
+  const visionAttempts = [];
+  const visionDeadline = Date.now() + visionBudgetMs;
+  const remaining = () => visionDeadline - Date.now();
 
   // Gemini: reads the original file natively.
-  try {
-    const parts = isPdf ? [geminiPdfPart(buffer)] : geminiImageParts([{ buffer, mime }]);
-    let prompt = basePrompt + transcriptBlock(transcript, { canSeePages: true });
-    if (structuredText && structuredText.trim().length > 20 && !doc) {
-      prompt += `\n\nGROUND TRUTH TEXT (extracted with 100% accuracy from the original document, including exact table cell values marked with [TABLE]/[/TABLE]): use these EXACT values for any text/numbers/table cells.\n\n${structuredText.slice(0, 12000)}`;
-    }
-    if (!genAI) throw new Error('GEMINI_API_KEY not configured');
-    const model = geminiModel({ responseMimeType: 'application/json', temperature: 0 });
-    const geminiBudget = process.env.MISTRAL_API_KEY ? Math.min(GEMINI_TIMEOUT_WITH_FALLBACK_MS, GEMINI_VISION_TIMEOUT_MS) : GEMINI_VISION_TIMEOUT_MS;
-    raw = await withTimeout(geminiGenerate(model, [...parts, { text: prompt }]), geminiBudget, 'gemini-vision');
-    retryFn = (retryPrompt) => geminiGenerate(model, [...parts, { text: retryPrompt + transcriptBlock(transcript, { canSeePages: true }) }]);
-    provider = 'gemini';
-  } catch (geminiErr) {
-    classifyProviderError('gemini', geminiErr);
+  const geminiParts = isPdf ? [geminiPdfPart(buffer)] : geminiImageParts([{ buffer, mime }]);
+  let geminiPrompt = basePrompt + transcriptBlock(transcript, { canSeePages: true });
+  if (structuredText && structuredText.trim().length > 20 && !doc) {
+    geminiPrompt += `\n\nGROUND TRUTH TEXT (extracted with 100% accuracy from the original document, including exact table cell values marked with [TABLE]/[/TABLE]): use these EXACT values for any text/numbers/table cells.\n\n${structuredText.slice(0, 12000)}`;
   }
+  const tryGemini = async (budgetMs) => {
+    if (provider || budgetMs < 10000 || isProviderCoolingDown('gemini')) return;
+    const started = Date.now();
+    try {
+      if (!genAI) throw new Error('GEMINI_API_KEY not configured');
+      const model = geminiModel({ responseMimeType: 'application/json', temperature: 0 });
+      const deadline = Date.now() + budgetMs;
+      raw = await withTimeout(geminiGenerate(model, [...geminiParts, { text: geminiPrompt }], { tries: 12, deadline }), budgetMs, 'gemini-vision');
+      retryFn = (retryPrompt) => geminiGenerate(model, [...geminiParts, { text: retryPrompt + transcriptBlock(transcript, { canSeePages: true }) }]);
+      provider = 'gemini';
+      markProviderResult('gemini', 'OK');
+    } catch (geminiErr) {
+      const status = classifyProviderError('gemini', geminiErr);
+      visionAttempts.push({ provider: 'gemini', status, detail: shortProviderError(geminiErr), ms: Date.now() - started });
+      if (status !== 'TEMPORARY_FAILURE') markProviderResult('gemini', status);
+    }
+  };
 
   // Mistral: looks at the rendered pages.
   const pageImages = doc && doc.pageImages.length ? doc.pageImages : (!isPdf ? [{ buffer, mime }] : []);
-  if (!provider && pageImages.length) {
+  const mistralUsable = () => !!process.env.MISTRAL_API_KEY && pageImages.length > 0 && !isProviderCoolingDown('mistral');
+  const tryMistral = async () => {
+    if (provider || !mistralUsable()) return;
+    const started = Date.now();
     try {
       const prompt = basePrompt + transcriptBlock(transcript, { canSeePages: true });
       raw = await callMistralVision(pageImages, prompt);
       retryFn = (retryPrompt) => callMistralVision(pageImages, retryPrompt + transcriptBlock(transcript, { canSeePages: true }));
       provider = 'mistral';
+      markProviderResult('mistral', 'OK');
     } catch (mistralErr) {
-      classifyProviderError('mistral', mistralErr);
+      const status = classifyProviderError('mistral', mistralErr);
+      visionAttempts.push({ provider: 'mistral', status, detail: shortProviderError(mistralErr), ms: Date.now() - started });
+      markProviderResult('mistral', status);
     }
+  };
+
+  if (!genAI || isProviderCoolingDown('gemini')) {
+    if (!genAI) visionAttempts.push({ provider: 'gemini', status: 'DISABLED', detail: 'GEMINI_API_KEY not configured', ms: 0 });
+    await tryMistral();
+  } else {
+    // Short first try only when Mistral can take over; otherwise Gemini gets the whole budget.
+    const firstBudget = mistralUsable() ? Math.min(GEMINI_TIMEOUT_WITH_FALLBACK_MS, GEMINI_VISION_TIMEOUT_MS, remaining()) : remaining();
+    await tryGemini(firstBudget);
+    await tryMistral();
+    // Mistral missing or failing too: Gemini's "high demand" spells are usually short — keep trying it.
+    await tryGemini(remaining());
   }
 
   // Groq text: the transcript only.
@@ -1575,6 +1669,8 @@ async function generateQuizFromDocument({ buffer, mime, grade, subject, school, 
   const result = applyExplicitMetadata(normalizeQuestionFields(await retryIncompleteTasks(quiz, retryFn)), sourceText);
   result.visualUnderstandingAvailable = visualUnderstandingAvailable;
   result.provider = provider;
+  result.visionAttempts = visionAttempts;
+  if (!visualUnderstandingAvailable) result.visionUnavailableReason = describeVisionFailure(visionAttempts);
   if (doc) {
     result.documentDiagnostics = doc.diagnostics;
     if (!result.language && doc.scripts.length) result.language = SCRIPT_LANGUAGE_NAMES[doc.scripts[0]] || '';
@@ -1606,7 +1702,27 @@ async function generateQuizFromDocument({ buffer, mime, grade, subject, school, 
   const sourceSectionEstimate = estimateSourceSectionCount(sourceText);
   result.conversionReport = buildConversionReport(result, { sourceSectionEstimate, sourceText });
   result.conversionReport.sourceSectionEstimate = sourceSectionEstimate;
+  if (result.visionUnavailableReason) result.conversionReport.visionNote = result.visionUnavailableReason;
+  assertQuizHasContent(result);
   return result;
+}
+
+// Never hand the teacher an empty quiz to review: a job that read nothing
+// fails with a specific reason, and the upload screen offers Retry.
+class EmptyQuizError extends Error {
+  constructor(message) { super(message); this.name = 'EmptyQuizError'; this.code = 'EMPTY_QUIZ'; }
+}
+function assertQuizHasContent(quiz) {
+  const tasks = Array.isArray(quiz && quiz.tasks) ? quiz.tasks : [];
+  if (tasks.some(taskHasRealContent)) return;
+  const why = quiz && quiz.visionUnavailableReason
+    ? quiz.visionUnavailableReason.replace(/, so this quiz was built.*$/, '.')
+    : '';
+  throw new EmptyQuizError(
+    `No questions could be read from this worksheet${tasks.length ? ` (${tasks.length} task heading(s) found, but no questions under them)` : ''}. `
+    + (why ? `${why} ` : '')
+    + 'Press Retry in a few minutes, or upload a clearer PDF/Word file.'
+  );
 }
 
 const SCRIPT_LANGUAGE_NAMES = {
@@ -1616,7 +1732,9 @@ const SCRIPT_LANGUAGE_NAMES = {
 
 module.exports = {
   generateQuizFromImage, generateQuizFromPdf, generateQuizFromDocument, callGeminiVision, callQwenVision, callQwenVisionRaw, callGroqTextVisionFallback, callQwenOcrText, callTesseractOcrText, detectScriptLang, callOcrText, looksLikeDecodableImage, buildQuizFromWorksheetText, callGroqWithText, rasterizePdfPagesToImage, buildQuizVisionPrompt, cleanLLMJson, findIncompleteTasks, retryIncompleteTasks, htmlToStructuredText, extractPdfEmbeddedImages, hostExtractedImages,
-  geminiImageParts, geminiPdfPart, geminiRetry, geminiGenerate, geminiModel, withTimeout, GEMINI_VISION_TIMEOUT_MS,
+  geminiImageParts, geminiPdfPart, geminiRetry, geminiGenerate, geminiModel, withTimeout, GEMINI_VISION_TIMEOUT_MS, GEMINI_MODELS,
+  VISION_TOTAL_BUDGET_MS, SYNC_VISION_BUDGET_MS,
+  markProviderResult, isProviderCoolingDown, resetProviderCooldowns, describeVisionFailure, shortProviderError, assertQuizHasContent, EmptyQuizError,
   PROVIDER_STATUS, classifyProviderError,
   enforceVisualGrounding, isVisuallyDependentQuestion, isAnswerGroundedInSource, VISUAL_UNAVAILABLE_MESSAGE, flagUnverifiedNumbers,
   computeExtractionStatus, normalizeQuestionFields, flagUngroundedTaskContent, extractContentTokens, CONTENT_GROUNDING_NOTE,
