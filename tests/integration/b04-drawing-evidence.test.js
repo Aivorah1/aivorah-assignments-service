@@ -36,12 +36,6 @@ jest.mock('@google/generative-ai', () => ({
   })),
 }));
 
-const mockMistralVision = jest.fn();
-jest.mock('../../services/worksheet/providers', () => ({
-  ...jest.requireActual('../../services/worksheet/providers'),
-  callMistralVision: (...args) => mockMistralVision(...args),
-}));
-
 const mockCloudinaryUpload = jest.fn();
 jest.mock('cloudinary', () => ({
   v2: { config: jest.fn(), uploader: { upload: (...args) => mockCloudinaryUpload(...args) } },
@@ -69,7 +63,6 @@ beforeEach(() => {
   mockSb.reset();
   mockGroqCreate.mockReset();
   mockGeminiGenerate.mockClear();
-  mockMistralVision.mockReset();
   mockCloudinaryUpload.mockReset();
 });
 
@@ -233,8 +226,10 @@ describe('drawing grading uses Gemini vision with the real grade', () => {
   });
 });
 
-test('Gemini and Groq vision both fail -> Mistral vision grades it', async () => {
-  process.env.MISTRAL_API_KEY = 'test-mistral';
+test('Gemini and Groq vision both fail -> the drawing waits for the teacher (no other AI service is called)', async () => {
+  const realFetch = global.fetch;
+  const fetchSpy = jest.fn().mockRejectedValue(new Error('no other AI service may be called'));
+  global.fetch = fetchSpy;
   mockSb.setTable('assignments', [
     { data: baseAssignmentRow({ grade: 'Grade 8', task_steps: [{ type: 'drawing', label: 'Draw a right triangle' }] }), error: null },
     { data: baseAssignmentRow(), error: null },
@@ -243,21 +238,18 @@ test('Gemini and Groq vision both fail -> Mistral vision grades it', async () =>
   mockCloudinaryUpload.mockResolvedValue({ secure_url: 'https://res.cloudinary.com/evidence/tri.jpg' });
   mockGroqCreate
     .mockRejectedValueOnce(new Error('[402 Payment Required] Your prepayment credits are depleted'))
-    .mockRejectedValueOnce(new Error('Groq 503 overloaded'))
-    .mockResolvedValueOnce(groqJson({ text: 'Great job!' }));
-  mockMistralVision.mockResolvedValueOnce('Here you go: {"answered":true,"score":82,"studentAnswer":"A right triangle with sides labelled.","correct":true,"comment":"Good!","teacherNote":""}');
+    .mockRejectedValueOnce(new Error('Groq 400 invalid image'))
+    .mockResolvedValue(groqJson({ text: 'Great job!' }));
 
   const res = await request(app).post('/assignments/a1/submit').send({
     studentId: STUDENT_UUID,
     stepAnswers: [{ type: 'drawing', drawingBase64: 'ZmFrZS1pbWFnZS1kYXRh', drawingMime: 'image/png' }],
   });
-  delete process.env.MISTRAL_API_KEY;
+  global.fetch = realFetch;
 
   expect(res.status).toBe(200);
-  expect(res.body.perQuestion[0]).toMatchObject({ score: 82, needsReview: false });
-  const [images, prompt] = mockMistralVision.mock.calls[0];
-  expect(images[0].mime).toBe('image/png');
-  expect(prompt).toContain('Grade 8');
+  expect(res.body.perQuestion[0]).toMatchObject({ needsReview: true });
+  expect(fetchSpy).not.toHaveBeenCalled();
 });
 
 test('Gemini out of credits (402) falls back to Groq vision instead of Review', async () => {

@@ -1,59 +1,71 @@
-// AI providers for worksheet → quiz generation, beyond Gemini (quizVision.js):
-//   - Mistral vision (page images + transcript) — second vision provider so a
-//     Gemini outage no longer drops every worksheet to text-only,
+// AI providers for worksheet → quiz generation, beyond Gemini (quizVision.js).
+// Only two AI accounts are used: Gemini and Groq (2026-11-24 decision —
+// Mistral and Hugging Face/Qwen were removed).
+//   - Groq vision (page images + transcript) — the second picture reader, so
+//     a busy Gemini no longer drops every worksheet to text-only,
 //   - picture hosting aligned with the document model's picture list,
 //   - the shared transcript block every provider is given,
 //   - a cached health check so a dead key shows up as a status, not as
 //     silently degraded quizzes.
-const MISTRAL_URL = 'https://api.mistral.ai/v1/chat/completions';
-const MISTRAL_VISION_MODELS = (process.env.MISTRAL_VISION_MODEL || 'mistral-medium-latest,mistral-small-latest')
+// Groq's vision model(s), tried in order. Llama-4 vision models are gone from Groq (404).
+const GROQ_VISION_MODELS = (process.env.GROQ_VISION_MODEL || 'qwen/qwen3.8-27b')
   .split(',').map(m => m.trim()).filter(Boolean);
-const MISTRAL_MAX_IMAGES = 8;
-const MISTRAL_TIMEOUT_MS = parseInt(process.env.MISTRAL_TIMEOUT_MS || '90000', 10);
+const GROQ_MAX_IMAGES = 5; // Groq's per-request image limit
+const GROQ_VISION_TIMEOUT_MS = parseInt(process.env.GROQ_VISION_TIMEOUT_MS || '120000', 10);
 
-// Page renders → JPEGs small enough for a vision request (≤1600px wide).
+// Page renders / photos → JPEGs small enough for a vision request
+// (≤1600px wide; Groq rejects base64 images over 4MB).
 async function toVisionJpeg(buffer, mime) {
   const { jimpFromPng, isPng } = require('./pngImage');
-  if (!isPng(buffer)) return { buffer, mime: mime || 'image/jpeg' }; // an uploaded photo: send as-is
-  const img = jimpFromPng(buffer);
+  if (isPng(buffer)) {
+    const img = jimpFromPng(buffer);
+    if (img.bitmap.width > 1600) img.resize({ w: 1600 });
+    return { buffer: await img.getBuffer('image/jpeg', { quality: 80 }), mime: 'image/jpeg' };
+  }
+  if (buffer.length <= 2.5 * 1024 * 1024) return { buffer, mime: mime || 'image/jpeg' }; // an uploaded photo: send as-is
+  const { Jimp } = require('jimp');
+  const img = await Jimp.read(buffer);
   if (img.bitmap.width > 1600) img.resize({ w: 1600 });
   return { buffer: await img.getBuffer('image/jpeg', { quality: 80 }), mime: 'image/jpeg' };
 }
 
-async function callMistralVision(pageImages, prompt) {
-  const apiKey = process.env.MISTRAL_API_KEY;
-  if (!apiKey) throw new Error('MISTRAL_API_KEY not configured');
-  if (!pageImages || !pageImages.length) throw new Error('Mistral vision: no page images');
+let groqClient = null;
+function groq() {
+  if (!process.env.GROQ_API_KEY) throw new Error('GROQ_API_KEY not configured');
+  if (!groqClient) {
+    const Groq = require('groq-sdk');
+    groqClient = new Groq({ apiKey: process.env.GROQ_API_KEY });
+  }
+  return groqClient;
+}
+
+// Images + prompt → the model's text (reasoning tags stripped).
+async function callGroqVision(pageImages, prompt, { json = false, maxTokens = 16000 } = {}) {
+  if (!pageImages || !pageImages.length) throw new Error('Groq vision: no images');
+  const client = groq();
   const images = [];
-  for (const p of pageImages.slice(0, MISTRAL_MAX_IMAGES)) {
+  for (const p of pageImages.slice(0, GROQ_MAX_IMAGES)) {
     const v = await toVisionJpeg(p.buffer, p.mime);
-    images.push({ type: 'image_url', image_url: `data:${v.mime};base64,${v.buffer.toString('base64')}` });
+    images.push({ type: 'image_url', image_url: { url: `data:${v.mime};base64,${v.buffer.toString('base64')}` } });
   }
   let lastErr;
-  for (const model of MISTRAL_VISION_MODELS) {
+  for (const model of GROQ_VISION_MODELS) {
     try {
-      const res = await fetch(MISTRAL_URL, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-        signal: AbortSignal.timeout(MISTRAL_TIMEOUT_MS),
-        body: JSON.stringify({
-          model,
-          temperature: 0,
-          max_tokens: 16000,
-          response_format: { type: 'json_object' },
-          messages: [{ role: 'user', content: [{ type: 'text', text: prompt }, ...images] }],
-        }),
-      });
-      if (!res.ok) throw new Error(`Mistral ${model} ${res.status}: ${(await res.text()).slice(0, 200)}`);
-      const json = await res.json();
-      const content = json.choices?.[0]?.message?.content;
-      if (!content) throw new Error(`Mistral ${model}: empty response`);
-      return typeof content === 'string' ? content : content.map(c => c.text || '').join('');
+      const completion = await client.chat.completions.create({
+        model,
+        temperature: 0,
+        max_completion_tokens: maxTokens,
+        ...(json ? { response_format: { type: 'json_object' } } : {}),
+        messages: [{ role: 'user', content: [{ type: 'text', text: prompt }, ...images] }],
+      }, { timeout: GROQ_VISION_TIMEOUT_MS });
+      const content = completion.choices?.[0]?.message?.content;
+      if (!content) throw new Error(`Groq vision ${model}: empty response`);
+      return String(content).replace(/<think>[\s\S]*?<\/think>/g, '').trim();
     } catch (err) {
       lastErr = err;
       // A retired/unknown model or overload moves on to the next; auth/quota errors won't improve.
-      if (!/404|400|invalid model|not found|429|503|overloaded|timeout|aborted/i.test(String(err.message))) throw err;
-      console.log(`[mistral] ${model} unavailable (${String(err.message).slice(0, 120)}), trying next model`);
+      if (!/404|400|invalid model|not found|decommissioned|429|503|overloaded|timeout|aborted/i.test(String(err.message))) throw err;
+      console.log(`[groq-vision] ${model} unavailable (${String(err.message).slice(0, 120)}), trying next model`);
     }
   }
   throw lastErr;
@@ -133,27 +145,26 @@ async function checkProviders({ force = false } = {}) {
     probe('gemini', async () => {
       if (!process.env.GEMINI_API_KEY) throw new Error('GEMINI_API_KEY not configured');
       const { GoogleGenerativeAI } = require('@google/generative-ai');
-      const models = (process.env.GEMINI_MODEL || 'gemini-2.5-flash').split(',').map(m => m.trim()).filter(Boolean);
+      const { GEMINI_MODELS, shortProviderError } = require('../quizVision');
       const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
       const errors = [];
-      for (const model of models) {
+      for (const model of GEMINI_MODELS) {
+        const started = Date.now();
         try {
           await genAI.getGenerativeModel({ model }).generateContent('Reply with OK');
-          return `model ${model} answered`;
-        } catch (err) { errors.push(`${model}: ${String(err.message).slice(0, 120)}`); }
+          return `model ${model} answered in ${Date.now() - started}ms${errors.length ? ` (before it: ${errors.join(' | ')})` : ''}`;
+        } catch (err) { errors.push(`${model}: ${shortProviderError(err)}`); }
       }
       throw new Error(errors.join(' | '));
     }),
-    probe('mistral', async () => {
-      if (!process.env.MISTRAL_API_KEY) throw new Error('MISTRAL_API_KEY not configured');
-      const res = await fetch(MISTRAL_URL, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${process.env.MISTRAL_API_KEY}`, 'Content-Type': 'application/json' },
-        signal: AbortSignal.timeout(20000),
-        body: JSON.stringify({ model: MISTRAL_VISION_MODELS[0], max_tokens: 5, messages: [{ role: 'user', content: 'Reply with OK' }] }),
-      });
-      if (!res.ok) throw new Error(`${res.status}: ${(await res.text()).slice(0, 150)}`);
-      return `model ${MISTRAL_VISION_MODELS[0]} answered`;
+    probe('groq-vision', async () => {
+      // A tiny real picture, so this checks the vision model itself.
+      const { Jimp } = require('jimp');
+      const img = new Jimp({ width: 64, height: 64, color: 0xffffffff });
+      const buffer = await img.getBuffer('image/png');
+      const started = Date.now();
+      await callGroqVision([{ buffer, mime: 'image/png' }], 'Reply with OK', { maxTokens: 20 });
+      return `model ${GROQ_VISION_MODELS[0]} answered in ${Date.now() - started}ms`;
     }),
     probe('groq', async () => {
       if (!process.env.GROQ_API_KEY) throw new Error('GROQ_API_KEY not configured');
@@ -164,7 +175,10 @@ async function checkProviders({ force = false } = {}) {
       return 'text model answered';
     }),
   ]);
-  const vision = results.filter(r => ['gemini', 'mistral'].includes(r.provider) && r.status === 'OK').map(r => r.provider);
+  // The pipeline skips a provider that is rate-limited / out of quota for a while.
+  const { markProviderResult } = require('../quizVision');
+  for (const r of results) if (r.status !== 'TEMPORARY_FAILURE') markProviderResult(r.provider, r.status);
+  const vision = results.filter(r => ['gemini', 'groq-vision'].includes(r.provider) && r.status === 'OK').map(r => r.provider);
   const result = {
     checkedAt: new Date().toISOString(),
     visionAvailable: vision.length > 0,
@@ -177,4 +191,4 @@ async function checkProviders({ force = false } = {}) {
   return result;
 }
 
-module.exports = { callMistralVision, hostPictures, transcriptBlock, checkProviders, MISTRAL_VISION_MODELS };
+module.exports = { callGroqVision, toVisionJpeg, hostPictures, transcriptBlock, checkProviders, GROQ_VISION_MODELS };

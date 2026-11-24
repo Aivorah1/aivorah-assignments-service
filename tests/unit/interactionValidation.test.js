@@ -55,6 +55,21 @@ describe('estimateSourceSectionCount - deterministic, non-LLM, language-agnostic
     expect(estimateSourceSectionCount('')).toBe(0);
     expect(estimateSourceSectionCount(null)).toBe(0);
   });
+  test('a sheet that labels its tasks is counted by those labels, not by blank lines (MHLE-31: 5, not ~19)', () => {
+    const transcript = [
+      'Must Do', 'Task 1: Find the area and perimeter of the given shapes in each grid.', '',
+      '[IMAGE: url=img://p1-2]   |   [IMAGE: url=img://p1-3]', '', 'Perimeter = | Perimeter =', '', 'Area = | Area =', '',
+      'Task 2: Measure the given angles using protractor.', '', '[IMAGE: url=img://p1-1]', '',
+      'Could do:', 'Task 3: Match the length and width.', '', '[IMAGE: url=img://p2-7]', '',
+      'Task 4: Find the area and perimeter of the given squares.', '', 'a)Side =6cm | b)Find the side', '', 'Perimeter = | cm', '',
+      'Enrichment Task: Relationship of area and perimeter.', '', 'Draw a square with the same area and perimeter.', '',
+      'Feedback to Feedforward:', '', 'Credits: Team PYP 4',
+    ].join('\n');
+    expect(estimateSourceSectionCount(transcript)).toBe(5);
+  });
+  test('a repeated task label (e.g. a page header) is counted once', () => {
+    expect(estimateSourceSectionCount('Activity 1: Read\n\nActivity 1 (contd.)\n\nActivity 2: Write')).toBe(2);
+  });
   test('a single block with no blank-line separation still returns at least 1', () => {
     expect(estimateSourceSectionCount('Just one continuous paragraph with no breaks at all.')).toBeGreaterThanOrEqual(1);
   });

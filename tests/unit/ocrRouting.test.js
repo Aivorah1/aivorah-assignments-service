@@ -6,6 +6,9 @@
 // local WASM, no API key) transcribed the same image correctly. Qwen is
 // kept for Latin/English content, where it already works reliably.
 jest.mock('../../services/supabase', () => ({ from: jest.fn() }));
+// 2026-11-24: only Gemini and Groq are used - the second OCR engine is Groq vision.
+const mockGroqCreate = jest.fn();
+jest.mock('groq-sdk', () => jest.fn().mockImplementation(() => ({ chat: { completions: { create: (...a) => mockGroqCreate(...a) } } })));
 
 const { looksLikeDecodableImage, detectScriptLang, callTesseractOcrText, callOcrText } = require('../../services/quizVision');
 
@@ -63,28 +66,27 @@ describe('callOcrText routing', () => {
   // router returning "monthly included credits" depleted in PRODUCTION,
   // an availability failure on top of the earlier-found Telugu accuracy
   // problem. Qwen is kept only as an opportunistic secondary.
-  test('uses Tesseract (not Qwen/fetch) for Latin/English content when Tesseract succeeds', async () => {
-    global.fetch = jest.fn().mockRejectedValue(new Error('should not be reached - Tesseract should succeed first'));
-    // TINY_PNG is a real, decodable (if content-less) PNG - Tesseract runs
-    // on it without error, so Qwen is never needed.
+  test('uses Tesseract (no AI call) for Latin/English content when Tesseract succeeds', async () => {
+    mockGroqCreate.mockReset().mockRejectedValue(new Error('should not be reached - Tesseract should succeed first'));
+    global.fetch = jest.fn().mockRejectedValue(new Error('no network expected'));
     await expect(callOcrText(TINY_PNG, 'image/png')).resolves.toEqual(expect.any(String));
+    expect(mockGroqCreate).not.toHaveBeenCalled();
     expect(global.fetch).not.toHaveBeenCalled();
   });
 
-  test('falls back to Qwen (via fetch) when Tesseract itself fails on a given image', async () => {
-    global.fetch = jest.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({ choices: [{ message: { content: 'Task 1: Solve. a) 2 + 2 = ___' } }] }),
-    });
-    // A garbage (non-decodable) buffer makes Tesseract throw via the
-    // format guard, exercising the fallback-to-Qwen path.
+  test('falls back to Groq vision transcription when Tesseract itself fails on a given image', async () => {
+    mockGroqCreate.mockReset().mockResolvedValue({ choices: [{ message: { content: 'Task 1: Solve. a) 2 + 2 = ___' } }] });
+    global.fetch = jest.fn().mockRejectedValue(new Error('no other AI service may be called'));
+    // A garbage (non-decodable) buffer makes Tesseract throw via the format guard.
     const text = await callOcrText(Buffer.from('garbage'), 'image/png');
-    expect(global.fetch).toHaveBeenCalledWith('https://router.huggingface.co/v1/chat/completions', expect.objectContaining({ method: 'POST' }));
     expect(text).toContain('2 + 2');
+    const call = mockGroqCreate.mock.calls[0][0];
+    expect(call.messages[0].content.some(c => c.type === 'image_url')).toBe(true);
+    expect(global.fetch).not.toHaveBeenCalled();
   });
 
   test('a garbage buffer with BOTH engines failing still fails cleanly, not a crash', async () => {
-    global.fetch = jest.fn().mockRejectedValue(new Error('Qwen also down'));
+    mockGroqCreate.mockReset().mockRejectedValue(new Error('Groq vision down'));
     await expect(callOcrText(Buffer.from('garbage'), 'image/png')).rejects.toThrow();
   });
 });

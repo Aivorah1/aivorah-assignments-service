@@ -24,7 +24,7 @@ const {
   TRANSLIT_LANG_CODES,
   TRANSLIT_ITC,
 } = require('../utils/quizHtmlRenderer');
-const { generateQuizFromImage, generateQuizFromPdf } = require('../services/quizVision');
+const { generateQuizFromImage, generateQuizFromPdf, SYNC_VISION_BUDGET_MS } = require('../services/quizVision');
 const { publishJob } = require('../services/jobQueue');
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
@@ -164,12 +164,13 @@ router.post('/generate-image', upload.single('image'), async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No image file uploaded' });
     const { grade, subject, school, language } = req.body;
     const mime = req.file.mimetype || 'image/png';
-    const quiz = await generateQuizFromImage(req.file.buffer, mime, { grade, subject, school, language });
+    const quiz = await generateQuizFromImage(req.file.buffer, mime, { grade, subject, school, language, visionBudgetMs: SYNC_VISION_BUDGET_MS });
     res.json({ quiz });
   } catch (err) {
     if (err.message === 'AI returned invalid JSON') {
       return res.status(500).json({ error: err.message, raw: err.raw });
     }
+    if (err.code === 'EMPTY_QUIZ') return res.status(422).json({ error: err.message, code: err.code });
     res.status(500).json({ error: err.message });
   }
 });
@@ -184,12 +185,13 @@ router.post('/generate', upload.single('pdf'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No PDF file uploaded' });
     const { grade, subject, school, structuredText, language } = req.body;
-    const quiz = await generateQuizFromPdf(req.file.buffer, { grade, subject, school, structuredText, language });
+    const quiz = await generateQuizFromPdf(req.file.buffer, { grade, subject, school, structuredText, language, visionBudgetMs: SYNC_VISION_BUDGET_MS });
     res.json({ quiz });
   } catch (err) {
     if (err.message === 'AI returned invalid JSON') {
       return res.status(500).json({ error: err.message, raw: err.raw });
     }
+    if (err.code === 'EMPTY_QUIZ') return res.status(422).json({ error: err.message, code: err.code });
     res.status(500).json({ error: err.message });
   }
 });

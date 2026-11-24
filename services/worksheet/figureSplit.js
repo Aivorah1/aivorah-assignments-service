@@ -80,7 +80,7 @@ function parseFigures(raw) {
     .map(f => ({ id: String(f.id), box: (f.box || f.box_2d).map(Number) }));
 }
 
-// Vision model → [{id, box:[ymin,xmin,ymax,xmax] 0-1000}]. Gemini first, Mistral after.
+// Vision model → [{id, box:[ymin,xmin,ymax,xmax] 0-1000}]. Gemini first, Groq vision after.
 async function detectFigures(picture, questions) {
   const prompt = figurePrompt(questions);
   const errors = [];
@@ -94,11 +94,11 @@ async function detectFigures(picture, questions) {
       errors.push('gemini: no figures');
     } catch (err) { errors.push(`gemini: ${err.message}`); }
   }
-  if (process.env.MISTRAL_API_KEY) {
+  if (process.env.GROQ_API_KEY) {
     try {
-      const { callMistralVision } = require('./providers');
-      return parseFigures(await callMistralVision([picture], prompt));
-    } catch (err) { errors.push(`mistral: ${err.message}`); }
+      const { callGroqVision } = require('./providers');
+      return parseFigures(await callGroqVision([picture], prompt, { json: true, maxTokens: 4000 }));
+    } catch (err) { errors.push(`groq-vision: ${err.message}`); }
   }
   if (errors.length) console.warn('[figureSplit] detection failed:', errors.join('; '));
   return [];

@@ -574,32 +574,8 @@ function drawingRubric(gradeLabel) {
 - Be specific about what you actually see drawn — do NOT invent elements that are not there`;
 }
 
-const GROQ_VISION_MODEL = process.env.GROQ_VISION_MODEL || 'qwen/qwen3.8-27b';
-
-// Groq caps base64 images at 4MB; phone photos often exceed that.
-async function shrinkForGroq({ buffer, mime }) {
-  if (buffer.length <= 2.5 * 1024 * 1024) return { buffer, mime };
-  const { Jimp } = require('jimp');
-  const img = await Jimp.read(buffer);
-  if (img.bitmap.width > 1600) img.resize({ w: 1600 });
-  return { buffer: await img.getBuffer('image/jpeg', { quality: 80 }), mime: 'image/jpeg' };
-}
-
-async function callGroqVision(buffers, prompt) {
-  const images = await Promise.all(buffers.map(shrinkForGroq));
-  const completion = await groq.chat.completions.create({
-    model: GROQ_VISION_MODEL,
-    temperature: 0,
-    messages: [{ role: 'user', content: [
-      { type: 'text', text: prompt },
-      ...images.map(i => ({ type: 'image_url', image_url: { url: `data:${i.mime};base64,${i.buffer.toString('base64')}` } })),
-    ] }],
-  });
-  return completion.choices[0].message.content.replace(/<think>[\s\S]*?<\/think>/g, '');
-}
-
-// Llama-4 vision models are gone from Groq (404); Gemini/HF credits can run out.
-// Chain: Gemini -> Groq Qwen -> Mistral -> HF Qwen (student's image only).
+// Only Gemini and Groq are used (Llama-4 vision models are gone from Groq, 404).
+// Chain: Gemini -> Groq vision.
 async function gradeImagesWithFallback(contentParts) {
   const prompt = contentParts.filter(p => p.type === 'text').map(p => p.text).join('\n\n');
   const images = (await Promise.all(contentParts.filter(p => p.type === 'image_url').map(p => toGeminiImagePart(p.image_url.url)))).filter(Boolean);
@@ -614,19 +590,11 @@ async function gradeImagesWithFallback(contentParts) {
   }
   const buffers = images.map(i => ({ buffer: Buffer.from(i.inlineData.data, 'base64'), mime: i.inlineData.mimeType }));
   if (process.env.GROQ_API_KEY) {
-    try { return await callGroqVision(buffers, prompt); } catch (e) { errors.push(`groq: ${e.message}`); }
-  }
-  if (process.env.MISTRAL_API_KEY) {
     try {
-      const { callMistralVision } = require('../services/worksheet/providers');
-      return await callMistralVision(buffers, prompt);
-    } catch (e) { errors.push(`mistral: ${e.message}`); }
+      const { callGroqVision } = require('../services/worksheet/providers');
+      return await callGroqVision(buffers, prompt);
+    } catch (e) { errors.push(`groq: ${e.message}`); }
   }
-  try {
-    const { callQwenVisionRaw } = require('../services/quizVision');
-    const last = buffers[buffers.length - 1];
-    return await callQwenVisionRaw(last.buffer, last.mime, prompt);
-  } catch (e) { errors.push(`qwen: ${e.message}`); }
   throw new Error(`all vision providers failed - ${errors.join(' | ').slice(0, 500)}`);
 }
 
@@ -827,20 +795,14 @@ const DEMO_MAP = {
 // Ported from ai-mentor/server/routes/assignments.js 2026-09-10 (B02/B04
 // follow-up) - see file header comment for the full rationale, especially
 // why the Qwen/Pixtral vision hops were dropped rather than ported as-is.
-// Image page, Gemini down: Mistral vision → Qwen vision → OCR + Groq text.
-// The last hop needs no vision provider, so title/grade/chapter still fill in.
+// Image page, Gemini down: Groq vision → OCR + Groq text.
+// The last hop needs no vision model, so title/grade/chapter still fill in.
 async function extractWithoutGemini(file, extractPrompt) {
   const buffer = Buffer.from(file.base64, 'base64');
-  if (process.env.MISTRAL_API_KEY) {
-    try {
-      const { callMistralVision } = require('../services/worksheet/providers');
-      return await callMistralVision([{ buffer, mime: file.mime }], extractPrompt);
-    } catch (err) { console.log('[extract] Mistral vision failed:', err.message); }
-  }
   try {
-    const { callQwenVisionRaw } = require('../services/quizVision');
-    return await callQwenVisionRaw(buffer, file.mime, extractPrompt);
-  } catch (err) { console.log('[extract] Qwen vision failed, reading the page with OCR:', err.message); }
+    const { callGroqVision } = require('../services/worksheet/providers');
+    return await callGroqVision([{ buffer, mime: file.mime }], extractPrompt, { json: true, maxTokens: 8000 });
+  } catch (err) { console.log('[extract] Groq vision failed, reading the page with OCR:', err.message); }
   const ocr = require('../services/worksheet/ocrEngine');
   const script = await ocr.detectScript(buffer);
   const { text } = await ocr.ocrImage(buffer, ocr.langsForScripts(script ? [script] : []));
@@ -1061,11 +1023,10 @@ GENERAL RULES:
 
     if (!merged.title && fileList.length > 0 && fileList[0].mime !== 'application/pdf') {
       try {
-        // Groq no longer offers a vision-capable model on this account -
-        // use Qwen (HF router) instead, same as the main extract fallback.
-        const { callQwenVisionRaw } = require('../services/quizVision');
+        // Groq vision, same as the main extract fallback.
+        const { callGroqVisionRaw } = require('../services/quizVision');
         const titleBuffer = Buffer.from(fileList[0].base64, 'base64');
-        const titleContent = await callQwenVisionRaw(titleBuffer, fileList[0].mime,
+        const titleContent = await callGroqVisionRaw(titleBuffer, fileList[0].mime,
           'What is the title or heading of this worksheet? Look for large, bold, or decorative text at the top of the page. Reply with ONLY the title text, nothing else. If you cannot find a title, reply with "NONE".');
         const titleRaw = titleContent.trim().replace(/^["']|["']$/g, '');
         console.log('[extract] Title fallback result:', titleRaw);
@@ -2036,11 +1997,10 @@ router.post('/pdf-to-quiz', async (req, res) => {
       const pdfData = await pdfParse(buffer);
       contentText = pdfData.text?.trim() || '';
     } else {
-      // Groq no longer offers a vision-capable model on this account - use
-      // Qwen (HF router) instead, same as the extract-questions fallback.
-      const { callQwenVisionRaw } = require('../services/quizVision');
+      // Groq vision, same as the extract-questions fallback.
+      const { callGroqVisionRaw } = require('../services/quizVision');
       const imgBuffer = Buffer.from(fileBase64, 'base64');
-      contentText = (await callQwenVisionRaw(imgBuffer, mimeType,
+      contentText = (await callGroqVisionRaw(imgBuffer, mimeType,
         'Extract ALL text content from this image. Include all questions, instructions, paragraphs, and any visible text. Return the raw text only, no formatting.')).trim();
     }
 
