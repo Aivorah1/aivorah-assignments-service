@@ -148,3 +148,19 @@ Fix
 - `GET /quiz/providers` shows each Gemini model's status code and how long the answering model took.
 
 On Render: `MISTRAL_API_KEY`, `MISTRAL_VISION_MODEL` and `HF_TOKEN` are no longer read and can be deleted. Gemini's free tier is often "high demand", so a paid Gemini key would make reading the pictures fast and reliable.
+
+### 2026-11-26 — live after PR #4: teachers' worksheet jobs never finished
+
+Live checks on `a834871`: `/quiz/generate` (sync) answered for MHLE-31 in 252 s, but every `/quiz/generate-async` job for it (what the upload wizard uses) stayed `processing` forever; a tiny worksheet's job finished in 43 s.
+
+Root causes
+1. **The legacy monolith was taking this service's jobs.** `ai-mentor` drains the same `upload_jobs` table every 4 s, claims ANY row in status `pending` (no type filter) and has its own `quiz_generate` / `worksheet_extract` handlers, so whichever server polled first got the teacher's job — and the monolith's old pipeline never finished it.
+2. **Nothing ever failed an orphaned or hung job**, so the teacher's spinner ran until the 10-minute client timeout with no message.
+3. **Groq vision: 413 "Request too large"** on the free (on-demand) tier — two ~1600 px pages + the full prompt + 16k output tokens. It was also misread as "rate-limited" (10-minute skip).
+4. **Groq text dropped whole tasks** (only Task 4 of 5); the retry only covered tasks that had a title but no questions.
+
+Fix
+- Jobs wait under `pending_assignments` (`JOB_PENDING_STATUS`), which only this service claims; the monolith never sees them. `GET /jobs/:id` still reports `pending`.
+- A job running longer than `JOB_TIMEOUT_MS` (12 min) fails with "took too long … press Retry"; one left `processing` by a restart for `JOB_STALE_MS` (15 min) fails with "the server restarted … press Retry" when polled. One drain at a time (no overlapping worksheet jobs on the 512 MB instance).
+- Groq vision pages go at ≤ `GROQ_IMAGE_MAX_WIDTH` (1024 px), JPEG q75, answer capped at `GROQ_VISION_MAX_TOKENS` (8000). 413 is classified `UNSUPPORTED` (no cooldown); provider details keep 400 chars with org ids masked.
+- `retryMissingTasks`: the sheet's labelled headings (Task N, Enrichment…) are compared with the quiz; the same engine is asked once for the missing ones, merged back in sheet order.

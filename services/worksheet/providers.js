@@ -12,21 +12,30 @@ const GROQ_VISION_MODELS = (process.env.GROQ_VISION_MODEL || 'qwen/qwen3.8-27b')
   .split(',').map(m => m.trim()).filter(Boolean);
 const GROQ_MAX_IMAGES = 5; // Groq's per-request image limit
 const GROQ_VISION_TIMEOUT_MS = parseInt(process.env.GROQ_VISION_TIMEOUT_MS || '120000', 10);
+// Groq's free (on-demand) tier rejects big requests with 413 "Request too
+// large" (live, 2026-11-26: two ~1600px pages + the full prompt + 16k output
+// tokens). Pages go at ≤1024px and the answer is capped, which fits.
+const GROQ_IMAGE_MAX_WIDTH = parseInt(process.env.GROQ_IMAGE_MAX_WIDTH || '1024', 10);
+const GROQ_VISION_MAX_TOKENS = parseInt(process.env.GROQ_VISION_MAX_TOKENS || '8000', 10);
 
 // Page renders / photos → JPEGs small enough for a vision request
 // (≤1600px wide; Groq rejects base64 images over 4MB).
-async function toVisionJpeg(buffer, mime) {
+async function toVisionJpeg(buffer, mime, maxWidth = 1600) {
   const { jimpFromPng, isPng } = require('./pngImage');
   if (isPng(buffer)) {
     const img = jimpFromPng(buffer);
-    if (img.bitmap.width > 1600) img.resize({ w: 1600 });
-    return { buffer: await img.getBuffer('image/jpeg', { quality: 80 }), mime: 'image/jpeg' };
+    if (img.bitmap.width > maxWidth) img.resize({ w: maxWidth });
+    return { buffer: await img.getBuffer('image/jpeg', { quality: 75 }), mime: 'image/jpeg' };
   }
-  if (buffer.length <= 2.5 * 1024 * 1024) return { buffer, mime: mime || 'image/jpeg' }; // an uploaded photo: send as-is
-  const { Jimp } = require('jimp');
-  const img = await Jimp.read(buffer);
-  if (img.bitmap.width > 1600) img.resize({ w: 1600 });
-  return { buffer: await img.getBuffer('image/jpeg', { quality: 80 }), mime: 'image/jpeg' };
+  if (buffer.length <= 400 * 1024) return { buffer, mime: mime || 'image/jpeg' }; // a small photo: send as-is
+  try {
+    const { Jimp } = require('jimp');
+    const img = await Jimp.read(buffer);
+    if (img.bitmap.width > maxWidth) img.resize({ w: maxWidth });
+    return { buffer: await img.getBuffer('image/jpeg', { quality: 75 }), mime: 'image/jpeg' };
+  } catch {
+    return { buffer, mime: mime || 'image/jpeg' }; // not decodable here: let the provider judge it
+  }
 }
 
 let groqClient = null;
@@ -40,12 +49,12 @@ function groq() {
 }
 
 // Images + prompt → the model's text (reasoning tags stripped).
-async function callGroqVision(pageImages, prompt, { json = false, maxTokens = 16000 } = {}) {
+async function callGroqVision(pageImages, prompt, { json = false, maxTokens = GROQ_VISION_MAX_TOKENS } = {}) {
   if (!pageImages || !pageImages.length) throw new Error('Groq vision: no images');
   const client = groq();
   const images = [];
   for (const p of pageImages.slice(0, GROQ_MAX_IMAGES)) {
-    const v = await toVisionJpeg(p.buffer, p.mime);
+    const v = await toVisionJpeg(p.buffer, p.mime, GROQ_IMAGE_MAX_WIDTH);
     images.push({ type: 'image_url', image_url: { url: `data:${v.mime};base64,${v.buffer.toString('base64')}` } });
   }
   let lastErr;

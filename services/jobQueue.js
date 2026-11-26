@@ -20,6 +20,21 @@ const TOPIC  = process.env.KAFKA_TOPIC || 'uploads';
 
 const handlers = new Map(); // type → async (payload, job) => result
 
+// This service's jobs wait under their OWN status, not 'pending'. The legacy
+// monolith (ai-mentor) drains the same upload_jobs table every 4s, claims ANY
+// 'pending' row regardless of type, and also has a 'quiz_generate' handler —
+// so it was taking teachers' worksheet jobs and running its old pipeline on
+// them; those jobs stayed 'processing' forever (2026-11-26, MHLE-31 live).
+// Under 'pending_assignments' only this service ever sees them.
+const PENDING = process.env.JOB_PENDING_STATUS || 'pending_assignments';
+// A job still running after JOB_TIMEOUT_MS is failed with a clear message, and
+// one left 'processing' by a restart/crash (no heartbeat for JOB_STALE_MS) is
+// failed when the client next polls it — never an endless spinner.
+const JOB_TIMEOUT_MS = parseInt(process.env.JOB_TIMEOUT_MS || String(12 * 60 * 1000), 10);
+const JOB_STALE_MS = parseInt(process.env.JOB_STALE_MS || String(15 * 60 * 1000), 10);
+const TIMEOUT_MESSAGE = 'Generating took too long and was stopped. Press Retry - it usually works on the second try; if not, upload a smaller or clearer file.';
+const STALE_MESSAGE = 'The server restarted while working on this file, so it was not finished. Press Retry.';
+
 /** Register a processor for a job type. Call at startup (see services/jobHandlers.js). */
 function registerHandler(type, fn) { handlers.set(type, fn); }
 
@@ -65,7 +80,7 @@ async function getProducer() {
  */
 async function publishJob(type, payload = {}) {
   const id = crypto.randomUUID();
-  const { error } = await supabase.from('upload_jobs').insert({ id, type, payload, status: 'pending' });
+  const { error } = await supabase.from('upload_jobs').insert({ id, type, payload, status: PENDING });
   if (error) throw new Error(`[jobQueue] enqueue failed (${error.message}). Did you run server/sql/upload_jobs.sql?`);
   if (DRIVER === 'kafka') {
     const producer = await getProducer();
@@ -84,15 +99,17 @@ async function processJobById(id) {
   const { data: claimed } = await supabase
     .from('upload_jobs')
     .update({ status: 'processing', locked_at: now, updated_at: now })
-    .eq('id', id).eq('status', 'pending')
+    .eq('id', id).eq('status', PENDING)
     .select();
   if (!claimed || claimed.length === 0) return false; // already taken / not pending
 
   const job = claimed[0];
+  let timer;
   try {
     const handler = handlers.get(job.type);
     if (!handler) throw new Error(`no handler registered for job type "${job.type}"`);
-    const result = await handler(job.payload, job);
+    const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(TIMEOUT_MESSAGE)), JOB_TIMEOUT_MS); });
+    const result = await Promise.race([handler(job.payload, job), timeout]);
     await supabase.from('upload_jobs')
       .update({ status: 'done', result: result ?? null, updated_at: new Date().toISOString() })
       .eq('id', id);
@@ -103,6 +120,8 @@ async function processJobById(id) {
       .eq('id', id);
     console.error(`[jobQueue] job ${id} (${job.type}) failed:`, err?.message || err);
     return false;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -110,7 +129,21 @@ async function processJobById(id) {
  * Drain up to `limit` pending jobs (db driver). Called by POST /jobs/process
  * (Cloud Scheduler) or a local loop. Returns { claimed, processed }.
  */
+// One drain at a time: the 4s interval would otherwise start a second worker
+// while a minutes-long worksheet job is still running (two Chrome/OCR runs on
+// a 512 MB instance). Jobs wait their turn instead.
+let draining = false;
 async function runWorkerOnce(limit = 5) {
+  if (draining) return { claimed: 0, processed: 0, busy: true };
+  draining = true;
+  try {
+    return await drainOnce(limit);
+  } finally {
+    draining = false;
+  }
+}
+
+async function drainOnce(limit) {
   // aivorah-assignments-service specific: this microservice and the
   // monolith (ai-mentor/server) share the SAME upload_jobs table (same
   // Supabase project) and BOTH run a local drain loop against it. Without
@@ -125,7 +158,7 @@ async function runWorkerOnce(limit = 5) {
   let query = supabase
     .from('upload_jobs')
     .select('id')
-    .eq('status', 'pending')
+    .eq('status', PENDING)
     .order('created_at', { ascending: true })
     .limit(limit);
   if (knownTypes.length > 0) query = query.in('type', knownTypes);
@@ -162,7 +195,18 @@ async function startConsumer() {
 
 async function getJob(id) {
   const { data } = await supabase.from('upload_jobs').select('*').eq('id', id).maybeSingle();
-  return data || null;
+  if (!data) return null;
+  // Orphaned by a restart/crash: nothing will ever finish it.
+  const since = Date.parse(data.locked_at || data.updated_at || data.created_at);
+  if (data.status === 'processing' && Number.isFinite(since) && Date.now() - since > JOB_STALE_MS) {
+    const now = new Date().toISOString();
+    await supabase.from('upload_jobs')
+      .update({ status: 'failed', error: STALE_MESSAGE, updated_at: now })
+      .eq('id', id).eq('status', 'processing');
+    return { ...data, status: 'failed', error: STALE_MESSAGE, updated_at: now };
+  }
+  // Clients see the usual pending | processing | done | failed.
+  return data.status === PENDING ? { ...data, status: 'pending' } : data;
 }
 
-module.exports = { DRIVER, publishJob, registerHandler, runWorkerOnce, processJobById, startConsumer, getJob };
+module.exports = { DRIVER, PENDING, JOB_STALE_MS, publishJob, registerHandler, runWorkerOnce, processJobById, startConsumer, getJob, TIMEOUT_MESSAGE, STALE_MESSAGE };

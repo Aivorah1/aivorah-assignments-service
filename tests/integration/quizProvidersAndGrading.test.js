@@ -108,6 +108,27 @@ describe('Groq vision request', () => {
     expect(content.filter(c => c.type === 'image_url').map(c => c.image_url.url.slice(0, 23))).toEqual(['data:image/jpeg;base64,', 'data:image/jpeg;base64,']);
   });
 
+  test('page images are shrunk to 1024px and the answer capped, so the free tier accepts the request', async () => {
+    process.env.GROQ_API_KEY = 'test';
+    const { callGroqVision } = require('../../services/worksheet/providers');
+    const { Jimp } = require('jimp');
+    const page = await new Jimp({ width: 1700, height: 2200, color: 0xffffffff }).getBuffer('image/png');
+    mockGroq.mockReset().mockResolvedValue({ choices: [{ message: { content: '{"tasks":[]}' } }] });
+    await callGroqVision([{ buffer: page, mime: 'image/png' }], 'PROMPT', { json: true });
+    const call = mockGroq.mock.calls[0][0];
+    expect(call.max_completion_tokens).toBe(8000);
+    const url = call.messages[0].content.find(c => c.type === 'image_url').image_url.url;
+    // Width from the JPEG frame header (Jimp.read can't run under jest).
+    const jpg = Buffer.from(url.split(',')[1], 'base64');
+    let width = 0;
+    for (let i = 2; i < jpg.length - 9;) {
+      const marker = jpg[i + 1];
+      if (marker >= 0xc0 && marker <= 0xc2) { width = jpg.readUInt16BE(i + 7); break; }
+      i += 2 + jpg.readUInt16BE(i + 2);
+    }
+    expect(width).toBe(1024);
+  });
+
   test('an auth error is not hidden by trying other models', async () => {
     process.env.GROQ_API_KEY = 'test';
     let callGroqVision;

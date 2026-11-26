@@ -578,6 +578,8 @@ function classifyProviderError(providerName, err) {
   const msg = String((err && err.message) || err || '');
   let status;
   if (/not configured/i.test(msg)) status = PROVIDER_STATUS.DISABLED;
+  // Too big for the account's per-request limit: a smaller request may work, so no cooldown.
+  else if (/\b413\b|request too large|request entity too large/i.test(msg)) status = PROVIDER_STATUS.UNSUPPORTED;
   else if (/depleted|exhausted|quota|monthly included credits/i.test(msg)) status = PROVIDER_STATUS.QUOTA_EXHAUSTED;
   else if (/rate.?limit|429|too many requests/i.test(msg)) status = PROVIDER_STATUS.RATE_LIMITED;
   else if (/401|403|unauthorized|invalid.?api.?key|authentication/i.test(msg)) status = PROVIDER_STATUS.AUTH_FAILURE;
@@ -977,17 +979,34 @@ function buildConversionReport(quiz, { sourceSectionEstimate, sourceText } = {})
 // count is only the fallback for sheets with no such labels.
 const TASK_HEADING_RE = /^(?:\*\*)?\s*(task|activity|exercise|section|part|worksheet\s+task)\s*[-–:.#]?\s*(\d{1,2}|[ivx]{1,4}|[a-h])\b/i;
 const ENRICHMENT_HEADING_RE = /^(?:\*\*)?\s*(enrichment|challenge|extension|bonus)(\s+(task|activity|question))?\b\s*[:\-–]/i;
-function countLabelledTaskHeadings(text) {
-  const seen = new Set();
-  for (const line of text.split('\n')) {
+function listLabelledTaskHeadings(text) {
+  const seen = new Map(); // key ("task 3", "enrichment …") → the heading as printed
+  for (const line of String(text || '').split('\n')) {
     for (const cell of line.split(/\s{2,}\|\s{2,}|\s\|\s/)) {
       const c = cell.trim();
       const m = c.match(TASK_HEADING_RE);
-      if (m) seen.add(`${m[1].toLowerCase()} ${m[2].toLowerCase()}`);
-      else if (ENRICHMENT_HEADING_RE.test(c)) seen.add(`enrichment ${c.slice(0, 12).toLowerCase()}`);
+      const key = m ? `${m[1].toLowerCase()} ${m[2].toLowerCase()}`
+        : ENRICHMENT_HEADING_RE.test(c) ? `enrichment ${c.slice(0, 12).toLowerCase()}` : null;
+      if (key && !seen.has(key)) seen.set(key, c.slice(0, 200));
     }
   }
-  return seen.size;
+  return [...seen].map(([key, heading]) => ({ key, heading }));
+}
+function countLabelledTaskHeadings(text) {
+  return listLabelledTaskHeadings(text).length;
+}
+
+// Headings printed on the sheet that no generated task stands for. A task
+// "stands for" heading "Task 3" when its title carries the same label.
+function findMissingLabelledTasks(quiz, sourceText) {
+  const titles = (quiz.tasks || []).map(t => String(t.title || '').replace(/\*\*/g, '').trim());
+  return listLabelledTaskHeadings(sourceText).filter(({ key }) => {
+    if (key.startsWith('enrichment')) return !titles.some(t => ENRICHMENT_HEADING_RE.test(t) || /^enrichment/i.test(t));
+    return !titles.some(t => {
+      const m = t.match(TASK_HEADING_RE);
+      return m && `${m[1].toLowerCase()} ${m[2].toLowerCase()}` === key;
+    });
+  });
 }
 function estimateSourceSectionCount(sourceText) {
   const text = String(sourceText || '').trim();
@@ -1164,6 +1183,37 @@ async function retryIncompleteTasks(quiz, retryFn) {
     }
     if (idx !== -1) quiz.tasks[idx] = { ...quiz.tasks[idx], ...rt, title: quiz.tasks[idx].title };
   });
+  return quiz;
+}
+
+// The model sometimes leaves whole tasks out (2026-11-26 live: Groq text
+// returned only Task 4 of MHLE-31's five). Ask the same engine once for the
+// labelled tasks that are missing and put them back in worksheet order.
+async function retryMissingTasks(quiz, retryFn, sourceText) {
+  const missing = findMissingLabelledTasks(quiz, sourceText);
+  if (!missing.length || !retryFn) return quiz;
+  const list = missing.map(m => `- ${m.heading}`).join('\n');
+  const prompt = `You previously extracted this worksheet into a quiz, but these tasks printed on the worksheet are MISSING from it:\n${list}\n\nProduce ONLY these tasks, in the order listed, fully populated with their real questions, answers, hints and solutions from the worksheet, using the exact same JSON schema and rules as before. Keep each task's printed heading as its title. Return {"tasks": [...]} containing just these tasks.`;
+  let data;
+  try {
+    data = JSON.parse(cleanLLMJson(await retryFn(prompt)));
+  } catch {
+    return quiz; // keep what we have; the report still flags the gap
+  }
+  const added = (data.tasks || []).filter(t => t && (taskHasRealContent(t) || (t.questions || []).length));
+  if (!added.length) return quiz;
+  const order = listLabelledTaskHeadings(sourceText).map(h => h.key);
+  const keyOf = (t) => {
+    const title = String(t.title || '').replace(/\*\*/g, '').trim();
+    const m = title.match(TASK_HEADING_RE);
+    if (m) return `${m[1].toLowerCase()} ${m[2].toLowerCase()}`;
+    return /^enrichment/i.test(title) ? order.find(k => k.startsWith('enrichment')) : null;
+  };
+  const rank = (t) => { const i = order.indexOf(keyOf(t)); return i === -1 ? order.length : i; };
+  quiz.tasks = [...(quiz.tasks || []), ...added]
+    .map((t, i) => ({ t, i }))
+    .sort((a, b) => rank(a.t) - rank(b.t) || a.i - b.i)
+    .map(x => x.t);
   return quiz;
 }
 
@@ -1493,13 +1543,15 @@ const { markProviderResult, isProviderCoolingDown, resetProviderCooldowns } = re
 // "[GoogleGenerativeAI Error]: Error fetching from https://…: [503 Service Unavailable] …" → "503 Service Unavailable …"
 function shortProviderError(err) {
   const msg = String((err && err.message) || err || '');
-  return msg.replace(/\[GoogleGenerativeAI Error\]:\s*/g, '').replace(/Error fetching from \S+?:\s*/g, '').replace(/[[\]]/g, '').slice(0, 160);
+  return msg.replace(/\[GoogleGenerativeAI Error\]:\s*/g, '').replace(/Error fetching from https?:\/\/\S+:\s+/g, '')
+    .replace(/org_[a-z0-9]+/gi, 'org_…').replace(/[[\]]/g, '').slice(0, 400);
 }
 
 const PROVIDER_LABELS = { gemini: 'Gemini', 'groq-vision': 'Groq vision' };
 const STATUS_WORDS = {
   RATE_LIMITED: 'is rate-limited', QUOTA_EXHAUSTED: 'is out of quota', AUTH_FAILURE: 'rejected the API key',
   DISABLED: 'is not configured', TEMPORARY_FAILURE: 'was overloaded, timed out or gave an unusable answer',
+  UNSUPPORTED: 'could not take a request this big on the current plan',
 };
 // One sentence a teacher can act on: why the pages couldn't be read with vision.
 function describeVisionFailure(attempts) {
@@ -1616,7 +1668,8 @@ async function generateQuizFromDocument({ buffer, mime, grade, subject, school, 
 
   const visualUnderstandingAvailable = provider === 'gemini' || provider === 'groq-vision';
   const quiz = applyExplicitMetadata(normalizeQuestionFields(parseQuizResponse(raw)), sourceText);
-  const result = applyExplicitMetadata(normalizeQuestionFields(await retryIncompleteTasks(quiz, retryFn)), sourceText);
+  const completed = await retryMissingTasks(await retryIncompleteTasks(quiz, retryFn), retryFn, sourceText);
+  const result = applyExplicitMetadata(normalizeQuestionFields(completed), sourceText);
   result.visualUnderstandingAvailable = visualUnderstandingAvailable;
   result.provider = provider;
   result.visionAttempts = visionAttempts;
@@ -1691,4 +1744,5 @@ module.exports = {
   buildConversionReport, taskHasRealContent, validateQuestionInteraction, estimateSourceSectionCount,
   GROQ_OUTPUT_TRUNCATED,
   extractExplicitMetadata, applyExplicitMetadata, findMissingNamedBlocks,
+  listLabelledTaskHeadings, findMissingLabelledTasks, retryMissingTasks,
 };
